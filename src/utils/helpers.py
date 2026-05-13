@@ -7,7 +7,9 @@ Used by both the test suite (for diagnostic output) and the main pipeline
 
 from __future__ import annotations
 
+import logging
 import sys
+import warnings
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -43,6 +45,13 @@ def setup_logger(level: str = "INFO") -> None:
             "<cyan>{name}</cyan>:<cyan>{line}</cyan> — <level>{message}</level>"
         ),
     )
+    # Silence PyTorch Lightning's verbose startup messages (GPU/TPU availability,
+    # LitLogger tip, etc.) — these clutter CV fold output without adding signal.
+    for _noisy in ("pytorch_lightning", "lightning", "lightning_fabric", "lightning.pytorch"):
+        logging.getLogger(_noisy).setLevel(logging.ERROR)
+    # Suppress the PL _pytree.py LeafSpec deprecation warning
+    warnings.filterwarnings("ignore", message=".*LeafSpec.*", category=UserWarning)
+    warnings.filterwarnings("ignore", message=".*treespec.*", category=UserWarning)
 
 
 # ---------------------------------------------------------------------------

@@ -121,8 +121,10 @@ HIST_COVARIATES: list[str] = [
     "growth_rate_1w",             # WW relative week-over-week change
     "relative_decay_rate",        # WW 7-day relative change; captures surge & decay
     "outlier_flag_int",
-    # Derivative expansion — velocity and rolling momentum (Phase 2)
-    "diff_concentration",             # absolute weekly Δ (velocity; complements relative growth_rate)
+    # Derivative expansion — velocity, acceleration, and rolling momentum (Phase 2/3)
+    "diff_concentration",             # 1st derivative: absolute weekly Δ (velocity)
+    "ww_accel",                       # 2nd derivative: Δ velocity (acceleration / inflection)
+    "diff_concentration_lag1w",       # velocity 1 week ago (momentum direction context)
     "log1p_concentration_2w_ma",      # 2-week rolling mean (short baseline)
     "log1p_concentration_4w_ma",      # 4-week rolling mean (medium baseline)
     "log1p_concentration_2w_std",     # 2-week rolling std (local volatility signal)

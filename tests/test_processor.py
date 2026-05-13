@@ -407,8 +407,8 @@ class TestWeeklyResample:
             .pipe(proc._rolling_smooth)
         )
         out = _run_stage(proc, "_resample_to_weekly", df)
-        # pandas resample("W") anchors to Sunday (weekday 6)
-        assert (out[NWSS_DATE_COL].dt.dayofweek == 6).all()
+        # W-WED spine anchors to Wednesday (dayofweek = 2)
+        assert (out[NWSS_DATE_COL].dt.dayofweek == 2).all()
 
     def test_fewer_rows_than_daily_input(self, full_pipeline_df):
         proc = _fresh()
@@ -455,12 +455,14 @@ class TestLogTransform:
         df = full_pipeline_df.pipe(proc._clean_columns).pipe(proc._apply_nondetect_censoring)
         df["concentration"] = df["pcr_target_avg_conc"].clip(lower=0)
         out = _run_stage(proc, "_log_transform", df)
-        assert TARGET_COL in out.columns
+        # _log_transform creates log1p_concentration (WW signal)
+        # log1p_new_cases (TARGET_COL) is added later when cases are merged
+        assert "log1p_concentration" in out.columns
 
     def test_log1p_of_zero_is_zero(self):
         df = pd.DataFrame([{"concentration": 0.0}])
         out = _run_stage(_fresh(), "_log_transform", df)
-        assert out[TARGET_COL].iloc[0] == pytest.approx(0.0)
+        assert out["log1p_concentration"].iloc[0] == pytest.approx(0.0)
 
     def test_log1p_values_non_negative(self, full_pipeline_df):
         proc = _fresh()
@@ -471,12 +473,12 @@ class TestLogTransform:
         )
         df["concentration"] = df["pcr_target_avg_conc"].clip(lower=0)
         out = _run_stage(proc, "_log_transform", df)
-        assert (out[TARGET_COL] >= 0).all()
+        assert (out["log1p_concentration"] >= 0).all()
 
     def test_log1p_mathematically_correct(self):
         df = pd.DataFrame([{"concentration": np.e - 1}])  # log(1 + e-1) = 1.0
         out = _run_stage(_fresh(), "_log_transform", df)
-        assert out[TARGET_COL].iloc[0] == pytest.approx(1.0)
+        assert out["log1p_concentration"].iloc[0] == pytest.approx(1.0)
 
 
 # ===========================================================================
@@ -543,7 +545,8 @@ class TestLagFeatures:
 
     def test_lag_columns_present(self, _pre_lag_df):
         out = _run_stage(_fresh(), "_add_lag_features", _pre_lag_df)
-        for col in [f"{TARGET_COL}_lag1w", f"{TARGET_COL}_lag2w", f"{TARGET_COL}_lag3w"]:
+        # WW concentration lags are created by the base processor (cases lags require CA processor)
+        for col in ["log1p_concentration_lag1w", "log1p_concentration_lag2w", "log1p_concentration_lag3w"]:
             assert col in out.columns
 
     def test_lag1w_correctly_shifted(self, _pre_lag_df):
@@ -552,10 +555,10 @@ class TestLagFeatures:
             grp = grp.sort_values(NWSS_DATE_COL).reset_index(drop=True)
             if len(grp) < 3:
                 continue
-            expected = grp[TARGET_COL].iloc[1]
-            actual_lag = grp[f"{TARGET_COL}_lag1w"].iloc[2]
+            expected = grp["log1p_concentration"].iloc[1]
+            actual_lag = grp["log1p_concentration_lag1w"].iloc[2]
             assert actual_lag == pytest.approx(expected, rel=1e-6), (
-                f"County {county}: lag1w at index 2 should equal target at index 1"
+                f"County {county}: lag1w at index 2 should equal log1p_concentration at index 1"
             )
 
     def test_growth_rate_column_present(self, _pre_lag_df):
@@ -635,9 +638,12 @@ class TestFullPipeline:
         out = _fresh().run(full_pipeline_df)
         assert out[COUNTY_COL].str.len().eq(5).all()
 
-    def test_output_columns_include_target_and_lags(self, full_pipeline_df):
+    def test_output_columns_include_ww_and_lags(self, full_pipeline_df):
         out = _fresh().run(full_pipeline_df)
-        expected = {TARGET_COL, f"{TARGET_COL}_lag1w", f"{TARGET_COL}_lag2w", f"{TARGET_COL}_lag3w"}
+        # Base WastewaterProcessor creates log1p_concentration + WW lags
+        # log1p_new_cases (TARGET_COL) requires CAWastewaterProcessor with cases data
+        expected = {"log1p_concentration", "log1p_concentration_lag1w",
+                    "log1p_concentration_lag2w", "log1p_concentration_lag3w"}
         assert expected.issubset(out.columns)
 
     def test_split_returns_three_non_overlapping_frames(self, full_pipeline_df):

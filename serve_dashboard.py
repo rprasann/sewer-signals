@@ -13,6 +13,8 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import json
+import math
 from pathlib import Path
 
 import pandas as pd
@@ -35,7 +37,7 @@ from src.config import (
     TARGET_COL,
 )
 from src.data_pipeline.processor import CAWastewaterProcessor
-from src.evaluation.metrics import QuantileColumns
+from src.evaluation.metrics import EvalResult, LeadTimeResult, QuantileColumns
 from src.models.tft_model import WastewaterTFT
 from src.utils.helpers import console, setup_logger
 from src.visualization.dashboard import create_app
@@ -56,6 +58,75 @@ def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Serve Dash dashboard from saved artefacts.")
     p.add_argument("--port", type=int, default=cfg.DASH_PORT)
     return p.parse_args()
+
+
+def _load_eval_result(path: Path) -> EvalResult | None:
+    """Reconstruct an EvalResult from a saved eval_summary.json.
+
+    The JSON may contain bare NaN tokens (written by Python's json module with
+    allow_nan=True), so we use pandas to parse it safely.
+    """
+    if not path.exists():
+        logger.warning("eval_summary.json not found at {} — bio-table will show static only.", path)
+        return None
+    try:
+        # pandas read_json handles NaN tokens that vanilla json.load rejects
+        series = pd.read_json(path, typ="series")
+        d = series.to_dict()
+
+        def _f(key: str) -> float:
+            v = d.get(key, float("nan"))
+            return float("nan") if (v is None or (isinstance(v, float) and math.isnan(v))) else float(v)
+
+        wis_per_county = {
+            k.replace("wis_", ""): float(v)
+            for k, v in d.items()
+            if k.startswith("wis_") and pd.notna(v)
+        }
+
+        lt = LeadTimeResult(
+            sensitivity=_f("sensitivity"),
+            specificity=_f("specificity"),
+            auc=_f("auc"),
+            mean_lead_days=_f("mean_lead_days"),
+            std_lead_days=_f("mean_lead_days"),  # not stored separately; reuse mean as placeholder
+        )
+
+        result = EvalResult(
+            mean_wis=_f("mean_wis"),
+            wis_per_county=wis_per_county,
+            coverage_50=_f("coverage_50"),
+            coverage_95=_f("coverage_95"),
+            smape=_f("smape"),
+            n_actual_onsets=int(d.get("n_actual_onsets", 0) or 0),
+            n_predicted_alerts=int(d.get("n_predicted_alerts", 0) or 0),
+            lead_time=lt,
+            n_observations=int(d.get("n_observations", 0) or 0),
+        )
+        logger.info(
+            "Eval loaded — WIS={:.3f}  coverage_95={:.1f}%  SMAPE={:.1f}%",
+            result.mean_wis,
+            result.coverage_95 * 100,
+            result.smape * 100,
+        )
+        return result
+
+    except Exception as exc:
+        logger.warning("Could not load eval_summary.json ({}), continuing without.", exc)
+        return None
+
+
+def _load_cv_results(path: Path) -> pd.DataFrame | None:
+    """Load cv_results.csv if present."""
+    if not path.exists():
+        return None
+    try:
+        df = pd.read_csv(path, parse_dates=["cutoff_date"])
+        logger.info("CV results loaded — {} folds.", len(df))
+        return df
+    except Exception as exc:
+        logger.warning("Could not load cv_results.csv ({}), continuing without.", exc)
+        return None
 
 
 def main() -> None:
@@ -89,11 +160,15 @@ def main() -> None:
     # ── 4. Detect quantile columns ────────────────────────────────────────────
     q_cols = QuantileColumns.auto_detect(forecast_display)
 
-    # ── 5. Load saved model ───────────────────────────────────────────────────
+    # ── 5. Load saved eval metrics & CV results ───────────────────────────────
+    eval_result = _load_eval_result(PROCESSED_DIR / "eval_summary.json")
+    cv_results  = _load_cv_results(PROCESSED_DIR / "cv_results.csv")
+
+    # ── 6. Load saved model ───────────────────────────────────────────────────
     logger.info("Loading saved TFT model …")
     model = WastewaterTFT.load()
 
-    # ── 6. Launch dashboard ───────────────────────────────────────────────────
+    # ── 7. Launch dashboard ───────────────────────────────────────────────────
     console.rule("[bold green] Launching Dash Dashboard [/bold green]")
     logger.info("Dashboard at http://localhost:{}", args.port)
     app = create_app(
@@ -103,6 +178,8 @@ def main() -> None:
         sludge_df=sludge_all,
         liquid_df=pd.DataFrame(),   # CA pipeline: solid track only
         q_cols=q_cols,
+        eval_result=eval_result,
+        cv_results=cv_results,
     )
     app.run(host=DASH_HOST, port=args.port, debug=DASH_DEBUG)
 

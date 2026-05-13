@@ -94,7 +94,8 @@ def _parse_args() -> argparse.Namespace:
     )
     p.add_argument("--fast", action="store_true", help="200 steps, skip CV")
     p.add_argument("--skip-cv", action="store_true", help="Skip expanding-window CV")
-    p.add_argument("--no-dash", action="store_true", help="Skip dashboard launch")
+    p.add_argument("--max-steps", type=int, default=None,
+                   help="Override max training steps (default: config value)")
     return p.parse_args()
 
 
@@ -227,15 +228,15 @@ def main() -> None:
     cfg.settings = cfg.EnvSettings()
 
     skip_cv   = args.skip_cv or args.fast
-    max_steps = 200 if args.fast else cfg.TFT_CONFIG["max_steps"]
+    max_steps = 200 if args.fast else (args.max_steps or cfg.TFT_CONFIG["max_steps"])
     cv_steps  = min(max_steps, 500)
 
     console.rule(
         "[bold white] Sewer Signals — Santa Clara Single-County Validation [/bold white]"
     )
     logger.info(
-        "SC run: max_steps={}, skip_cv={}, no_dash={}",
-        max_steps, skip_cv, args.no_dash,
+        "SC run: max_steps={}, skip_cv={}",
+        max_steps, skip_cv,
     )
 
     # ── 1. Load 9-county raw data ─────────────────────────────────────────────

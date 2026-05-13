@@ -604,8 +604,20 @@ class WastewaterProcessor:
             (df["concentration"] - conc_lag1) / (conc_lag1.abs() + 1e-6)
         ).clip(-5.0, 5.0)
 
-        # Derivative expansion — absolute velocity + rolling momentum statistics
-        df["diff_concentration"] = ww_grp.diff(1)
+        # Derivative expansion — velocity, acceleration, and rolling momentum statistics
+        df["diff_concentration"] = ww_grp.diff(1)                 # 1st derivative (velocity)
+
+        # Acceleration = second difference; captures inflection points of surges.
+        # Positive accel + positive velocity → acceleration phase (high alert).
+        # Negative accel + positive velocity → deceleration / approaching peak.
+        df["ww_accel"] = df.groupby(COUNTY_COL)["diff_concentration"].transform(
+            lambda s: s.diff(1)
+        )
+
+        # Lagged velocity: where was momentum 1 week ago?  Gives the model
+        # explicit "momentum direction" without recomputing from raw lags.
+        df["diff_concentration_lag1w"] = df.groupby(COUNTY_COL)["diff_concentration"].shift(1)
+
         df["log1p_concentration_2w_ma"]  = ww_grp.transform(
             lambda s: s.rolling(2, min_periods=1).mean()
         )
@@ -669,6 +681,8 @@ class WastewaterProcessor:
             "growth_rate_1w",                 # WW relative week-over-week growth (raw-conc basis)
             "relative_decay_rate",            # WW 7-day relative change
             "diff_concentration",             # absolute weekly Δ log1p_conc (velocity)
+            "ww_accel",                       # second Δ log1p_conc (acceleration)
+            "diff_concentration_lag1w",       # velocity 1 week ago (momentum direction)
             "log1p_concentration_2w_ma",      # 2-week rolling mean
             "log1p_concentration_4w_ma",      # 4-week rolling mean
             "log1p_concentration_2w_std",     # 2-week rolling std (local volatility)

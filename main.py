@@ -133,6 +133,15 @@ def _parse_args() -> argparse.Namespace:
         "--port", type=int, default=DASH_PORT,
         help="Dashboard server port",
     )
+    p.add_argument(
+        "--counties", type=str, default=None,
+        help=(
+            "Restrict pipeline to a subset of counties.  "
+            "Pass '3county' for the spatial-temporal validation set "
+            "(SF, San Mateo, Santa Clara), or a comma-separated list of "
+            "5-digit FIPS codes (e.g. '06075,06081,06085')."
+        ),
+    )
     return p.parse_args()
 
 
@@ -536,8 +545,8 @@ def _build_display_frames(
     # Undo scaler on forecast quantile columns
     q_col_list = [
         getattr(q_cols, attr)
-        for attr in ("q025", "q25", "q50", "q75", "q975")
-        if getattr(q_cols, attr) in forecast_df.columns
+        for attr in ("q025", "q10", "q25", "q50", "q75", "q90", "q975")
+        if getattr(q_cols, attr) is not None and getattr(q_cols, attr) in forecast_df.columns
     ]
     forecast_display = _invert_scaling_to_log1p(forecast_df, proc, cols=q_col_list)
 
@@ -557,8 +566,8 @@ def _build_decoded_forecast(
     """
     q_col_list = [
         getattr(q_cols, attr)
-        for attr in ("q025", "q25", "q50", "q75", "q975")
-        if getattr(q_cols, attr) in forecast_df.columns
+        for attr in ("q025", "q10", "q25", "q50", "q75", "q90", "q975")
+        if getattr(q_cols, attr) is not None and getattr(q_cols, attr) in forecast_df.columns
     ]
     df = _invert_scaling_to_log1p(forecast_df, proc, cols=q_col_list)
     for col in q_col_list:
@@ -615,6 +624,18 @@ def main() -> None:
     # ── 1. Load raw data ──────────────────────────────────────────────────────
     raw_ww    = _load_ca_ww_csv(CA_WW_CSV)
     raw_cases = _load_ca_cases_csv(CA_CASES_CSV)
+
+    # Optional county filter (--counties 3county | --counties 06075,06081,06085)
+    if args.counties:
+        if args.counties.strip().lower() == "3county":
+            county_filter = cfg.THREE_COUNTY_FIPS
+        else:
+            county_filter = [f.strip() for f in args.counties.split(",")]
+        county_names = [cfg.FIPS_TO_COUNTY[f] for f in county_filter if f in cfg.FIPS_TO_COUNTY]
+        logger.info("County filter active: {} ({})", county_filter, county_names)
+        # raw_ww uses 'county_name'; raw_cases uses COUNTY_COL (county_fips)
+        raw_ww    = raw_ww[raw_ww["county_name"].isin(county_names)].copy()
+        raw_cases = raw_cases[raw_cases[cfg.COUNTY_COL].isin(county_filter)].copy()
 
     # ── 2. Leakage-free processing  [INV-1, INV-3] ───────────────────────────
     proc, train_df, val_df, test_df = _process_sludge_track(raw_ww, raw_cases)

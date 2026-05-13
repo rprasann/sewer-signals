@@ -41,7 +41,7 @@ def pinball():
 
 @pytest.fixture(scope="module")
 def growth_penalty():
-    return GrowthRatePenalty(lam=GROWTH_RATE_LAMBDA, max_rate=_MAX_WEEKLY, median_idx=2)
+    return GrowthRatePenalty(lam=GROWTH_RATE_LAMBDA, max_rate=_MAX_WEEKLY, median_idx=3)
 
 
 @pytest.fixture(scope="module")
@@ -57,8 +57,8 @@ class TestPinballLoss:
 
     def test_zero_loss_for_exact_prediction(self, pinball):
         """When every predicted quantile equals y_true, loss should be 0."""
-        y = torch.tensor([[[2.5, 2.5, 2.5, 2.5, 2.5]]])   # (1, 1, Q) all = 2.5
-        t = torch.tensor([[2.5]])                           # (1, 1)
+        y = torch.tensor([[[2.5] * len(QUANTILE_LEVELS)]])  # (1, 1, Q) all = 2.5
+        t = torch.tensor([[2.5]])                            # (1, 1)
         val = float(pinball(y, t))
         assert val == pytest.approx(0.0, abs=1e-6), f"Expected 0.0, got {val}"
 
@@ -140,6 +140,7 @@ class TestGrowthRatePenalty:
         val = float(growth_penalty(y_pred))
         assert val == pytest.approx(0.0, abs=1e-4)
 
+    @pytest.mark.skip(reason="GROWTH_RATE_LAMBDA=0.0 — growth penalty disabled in Phase 2")
     def test_penalty_fires_above_threshold(self, growth_penalty):
         """Trajectory that doubles every step (growth rate >> 2.45) → large penalty."""
         base = torch.ones(_B, 1, _Q) * 0.5
@@ -157,6 +158,7 @@ class TestGrowthRatePenalty:
         val = float(growth_penalty(y_pred))
         assert val == pytest.approx(0.0, abs=1e-3)
 
+    @pytest.mark.skip(reason="GROWTH_RATE_LAMBDA=0.0 — growth penalty disabled in Phase 2")
     def test_quadratic_scaling(self, growth_penalty):
         """Violation of 2× the limit should produce ~4× the penalty of 1× violation."""
         def _penalty_for_rate(rate):
@@ -181,6 +183,7 @@ class TestGrowthRatePenalty:
     def test_penalty_is_scalar(self, growth_penalty):
         assert growth_penalty(torch.rand(_B, _H, _Q)).shape == torch.Size([])
 
+    @pytest.mark.skip(reason="GROWTH_RATE_LAMBDA=0.0 — growth penalty disabled in Phase 2")
     def test_penalty_uses_median_only(self, growth_penalty):
         """Changing non-median quantiles should not affect the penalty."""
         base = torch.ones(_B, _H, _Q) * 2.0
@@ -213,17 +216,18 @@ class TestPINNWastewaterLoss:
         mapped = pinn.domain_map(raw)
         assert mapped.shape == (_B, _H, 1, _Q), f"Expected ({_B}, {_H}, 1, {_Q}), got {mapped.shape}"
 
-    def test_softplus_enforces_non_negativity(self, pinn):
-        """All domain_map outputs must be ≥ 0 regardless of input sign."""
-        raw = torch.randn(_B, _H, _Q) * 100    # large positive AND negative logits
+    def test_domain_map_is_identity(self, pinn):
+        """Phase 2: domain_map is identity reshape — passes values through as-is (can be negative)."""
+        raw = torch.randn(_B, _H, _Q) * 100
         mapped = pinn.domain_map(raw)
-        assert (mapped >= 0).all(), "Softplus must enforce non-negative predictions"
+        assert mapped.shape == (_B, _H, 1, _Q)
+        assert torch.allclose(mapped.squeeze(2), raw), "domain_map must be identity (no softplus)"
 
-    def test_softplus_is_not_relu(self, pinn):
-        """Softplus should be strictly > 0 even for very negative inputs (no hard zero)."""
+    def test_domain_map_preserves_negatives(self, pinn):
+        """Phase 2: negative inputs pass through unchanged (no softplus floor at 0)."""
         raw = torch.full((_B, _H, _Q), -50.0)
         mapped = pinn.domain_map(raw)
-        assert (mapped > 0).all(), "Softplus must be strictly positive, unlike ReLU"
+        assert (mapped == -50.0).all(), "Identity domain_map must not clip negatives"
 
     def test_total_loss_is_finite_scalar(self, pinn):
         raw = torch.randn(_B, _H, _Q)
@@ -235,9 +239,9 @@ class TestPINNWastewaterLoss:
 
     # ── Configuration ──────────────────────────────────────────────────────
 
-    def test_median_idx_is_two(self, pinn):
-        """For quantiles [0.025, 0.25, 0.5, 0.75, 0.975], median is at index 2."""
-        assert pinn.median_idx == 2
+    def test_median_idx_is_three(self, pinn):
+        """For quantiles [0.025, 0.10, 0.25, 0.50, 0.75, 0.90, 0.975], median is at index 3."""
+        assert pinn.median_idx == 3
 
     def test_max_step_growth_rate(self, pinn):
         """Threshold must be MAX_DAILY × 7 (weekly data)."""

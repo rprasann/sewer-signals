@@ -74,6 +74,10 @@ FIPS_TO_COUNTY: dict[str, str] = {v: k for k, v in BAY_AREA_FIPS.items()}
 # Single-county validation target (largest, best-instrumented county)
 SANTA_CLARA_FIPS: str = "06085"
 
+# 3-county validation set: spatial-temporal synchrony benchmark
+# Chosen for high reporting density, strong correlation, and diverse population.
+THREE_COUNTY_FIPS: list[str] = ["06075", "06081", "06085"]  # SF, San Mateo, Santa Clara
+
 # Flat list of county names — used by CA dataset loaders (no FIPS needed there)
 BAY_AREA_COUNTIES: list[str] = list(BAY_AREA_FIPS.keys())
 
@@ -217,11 +221,12 @@ MAX_DAILY_GROWTH_RATE = 0.35        # ln(2)/2 ≈ 0.347; weekly threshold = ×7 
 
 # Underdispersion penalty — penalises the model when the predicted 95% PI is
 # narrower than MIN_PI_WIDTH scaled units.  After RobustScaling the IQR ≈ 1.0,
-# implying a normal-equivalent 95% PI width ≈ 2.9.  Setting MIN_PI_WIDTH=1.5
-# is conservative (~half that) — it prevents complete interval collapse without
-# dominating the pinball loss.
-UNDERDISPERSION_LAMBDA = 0.1        # weight of the underdispersion penalty
-MIN_PI_WIDTH = 1.5                  # minimum acceptable 95% PI width in scaled units
+# so a well-calibrated 95% PI for a normal distribution spans ≈ 2.9 scaled
+# units (±1.96σ, σ≈IQR/1.35).  Phase 3 values: lambda=0.5 (5× Phase 2) and
+# MIN_PI_WIDTH=2.5 (~86% of theoretical width) — strong enough to overcome the
+# pinball gradient that naturally collapses PIs, without dominating training.
+UNDERDISPERSION_LAMBDA = 0.5        # weight of underdispersion penalty (Phase 3: 0.1→0.5)
+MIN_PI_WIDTH = 2.5                  # minimum 95% PI width in scaled units (Phase 3: 1.5→2.5)
 
 QUANTILE_LEVELS = TFT_CONFIG["quantile_levels"]
 
@@ -240,7 +245,7 @@ WIS_MEDIAN_QUANTILE = 0.50
 # Outbreak detection threshold: signal > OUTBREAK_PERCENTILE of trailing baseline
 OUTBREAK_PERCENTILE = 90           # percentile of 90-day rolling baseline
 OUTBREAK_SUSTAINED_DAYS = 3        # must stay above threshold for N days
-OUTBREAK_GROWTH_THRESHOLD = 0.40   # 40% week-over-week increase flags onset (raised from 0.25 to reduce false positives)
+OUTBREAK_GROWTH_THRESHOLD = 0.25   # 25% WoW increase flags onset (Phase 3: lowered from 0.40 to lift sensitivity for AUC)
 LEAD_TIME_WINDOW_MIN = 7           # days before clinical confirmation
 LEAD_TIME_WINDOW_MAX = 21
 

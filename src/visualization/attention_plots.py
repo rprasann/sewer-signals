@@ -214,20 +214,21 @@ def plot_attention_heatmap(
 
     subtitle = f" — {FIPS_TO_COUNTY.get(county, county)}" if county else ""
     fig.update_layout(
-        title=dict(text=f"{title}{subtitle}", font=dict(size=18, color="#F5F5F5")),
+        title=dict(text=f"{title}{subtitle}", font=dict(size=18, color="#162032")),
         xaxis=dict(
-            title=dict(text="Context time-step (key)", font=dict(size=14)),
-            tickfont=dict(size=12),
+            title=dict(text="Context time-step (key)", font=dict(size=14, color="#576880")),
+            tickfont=dict(size=12, color="#576880"),
+            gridcolor="rgba(0,0,0,0.06)",
         ),
         yaxis=dict(
-            title=dict(text="Horizon step (query)", font=dict(size=14)),
-            tickfont=dict(size=12),
+            title=dict(text="Horizon step (query)", font=dict(size=14, color="#576880")),
+            tickfont=dict(size=12, color="#576880"),
         ),
         height=420,
         margin=dict(l=80, r=40, t=70, b=70),
-        plot_bgcolor="#1a1a2e",
-        paper_bgcolor="#16213e",
-        font=dict(color="#e0e0e0"),
+        plot_bgcolor="#FFFFFF",
+        paper_bgcolor="#F4F7FB",
+        font=dict(color="#162032"),
     )
     return fig
 
@@ -249,6 +250,9 @@ _COVARIATE_CATEGORY: dict[str, str] = {
     # Outbreak-phase dynamics
     "growth_rate_1w":            "Dynamics",
     "relative_decay_rate":       "Dynamics",
+    "diff_concentration":        "Dynamics",
+    "ww_accel":                  "Dynamics",
+    "diff_concentration_lag1w":  "Dynamics",
     "outlier_flag_int":          "QC Flag",
     "sin_annual_1":  "Seasonality", "cos_annual_1": "Seasonality",
     "sin_annual_2":  "Seasonality", "cos_annual_2": "Seasonality",
@@ -301,9 +305,9 @@ def plot_vsn_importance(
         fig = go.Figure()
         fig.add_annotation(text="No VSN weights available for this role.",
                            xref="paper", yref="paper", x=0.5, y=0.5,
-                           showarrow=False, font=dict(size=14, color="#aaa"))
-        fig.update_layout(paper_bgcolor="#16213e", plot_bgcolor="#1a1a2e",
-                          font=dict(color="#e0e0e0"), height=300, title=title)
+                           showarrow=False, font=dict(size=14, color="#576880"))
+        fig.update_layout(paper_bgcolor="#F4F7FB", plot_bgcolor="#FFFFFF",
+                          font=dict(color="#162032"), height=300, title=title)
         return fig
 
     w = np.asarray(weights[role])
@@ -328,18 +332,18 @@ def plot_vsn_importance(
     ))
 
     fig.update_layout(
-        title=dict(text=title, font=dict(size=16, color="#F5F5F5")),
+        title=dict(text=title, font=dict(size=16, color="#162032")),
         xaxis=dict(
-            title=dict(text="Importance (softmax weight)", font=dict(size=14)),
-            tickfont=dict(size=12),
-            gridcolor="rgba(255,255,255,0.08)",
+            title=dict(text="Importance (softmax weight)", font=dict(size=14, color="#576880")),
+            tickfont=dict(size=12, color="#576880"),
+            gridcolor="rgba(0,0,0,0.06)",
         ),
-        yaxis=dict(tickfont=dict(size=12)),
+        yaxis=dict(tickfont=dict(size=12, color="#162032")),
         height=max(280, 36 * n + 80),
         margin=dict(l=180, r=40, t=65, b=55),
-        plot_bgcolor="#1a1a2e",
-        paper_bgcolor="#16213e",
-        font=dict(color="#e0e0e0"),
+        plot_bgcolor="#FFFFFF",
+        paper_bgcolor="#F4F7FB",
+        font=dict(color="#162032"),
     )
     return fig
 

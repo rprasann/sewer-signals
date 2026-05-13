@@ -4897,6 +4897,87 @@ wheels = [
 ]
 
 [[package]]
+name = "sewer-surveillance"
+version = "1.0.0"
+source = { editable = "." }
+dependencies = [
+    { name = "anthropic" },
+    { name = "dash" },
+    { name = "dash-bootstrap-components" },
+    { name = "lightning" },
+    { name = "loguru" },
+    { name = "matplotlib" },
+    { name = "neuralforecast" },
+    { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
+    { name = "numpy", version = "2.4.4", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
+    { name = "pandas", version = "2.3.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
+    { name = "pandas", version = "3.0.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
+    { name = "plotly" },
+    { name = "pyarrow" },
+    { name = "pydantic" },
+    { name = "pydantic-settings" },
+    { name = "python-dotenv" },
+    { name = "requests" },
+    { name = "rich" },
+    { name = "scikit-learn", version = "1.7.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
+    { name = "scikit-learn", version = "1.8.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
+    { name = "seaborn" },
+    { name = "torch" },
+    { name = "tqdm" },
+]
+
+[package.optional-dependencies]
+dev = [
+    { name = "black" },
+    { name = "ipykernel" },
+    { name = "jupyter" },
+    { name = "mypy" },
+    { name = "pytest" },
+    { name = "pytest-cov" },
+    { name = "ruff" },
+]
+
+[package.dev-dependencies]
+dev = [
+    { name = "pytest-cov" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "anthropic", specifier = ">=0.39.0" },
+    { name = "black", marker = "extra == 'dev'", specifier = ">=24.3.0" },
+    { name = "dash", specifier = ">=2.16.0" },
+    { name = "dash-bootstrap-components", specifier = ">=1.6.0" },
+    { name = "ipykernel", marker = "extra == 'dev'", specifier = ">=6.29.0" },
+    { name = "jupyter", marker = "extra == 'dev'", specifier = ">=1.0.0" },
+    { name = "lightning", specifier = ">=2.2.0" },
+    { name = "loguru", specifier = ">=0.7.0" },
+    { name = "matplotlib", specifier = ">=3.8.0" },
+    { name = "mypy", marker = "extra == 'dev'", specifier = ">=1.9.0" },
+    { name = "neuralforecast", specifier = ">=1.7.4" },
+    { name = "numpy", specifier = ">=1.26.0" },
+    { name = "pandas", specifier = ">=2.2.0" },
+    { name = "plotly", specifier = ">=5.20.0" },
+    { name = "pyarrow", specifier = ">=15.0.0" },
+    { name = "pydantic", specifier = ">=2.6.0" },
+    { name = "pydantic-settings", specifier = ">=2.2.0" },
+    { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.1.0" },
+    { name = "pytest-cov", marker = "extra == 'dev'", specifier = ">=5.0.0" },
+    { name = "python-dotenv", specifier = ">=1.0.0" },
+    { name = "requests", specifier = ">=2.31.0" },
+    { name = "rich", specifier = ">=13.7.0" },
+    { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.3.0" },
+    { name = "scikit-learn", specifier = ">=1.4.0" },
+    { name = "seaborn", specifier = ">=0.13.0" },
+    { name = "torch", specifier = ">=2.2.0" },
+    { name = "tqdm", specifier = ">=4.66.0" },
+]
+provides-extras = ["dev"]
+
+[package.metadata.requires-dev]
+dev = [{ name = "pytest-cov", specifier = ">=7.1.0" }]
+
+[[package]]
 name = "six"
 version = "1.17.0"
 source = { registry = "https://pypi.org/simple" }
@@ -5304,87 +5385,6 @@ sdist = { url = "https://files.pythonhosted.org/packages/d9/55/8a37bb9ce36541fd3
 wheels = [
     { url = "https://files.pythonhosted.org/packages/6f/11/6c6ee61958b8e60f634b39e2f9a004f5d1c479cb962a2001fc3c72ceed78/utilsforecast-0.2.15-py3-none-any.whl", hash = "sha256:4b43bf5107e3cba13604cd86e93b5cf4906b57105b1900ccf98b8978aabd4150", size = 40344, upload-time = "2025-12-03T16:29:07.144Z" },
 ]
-
-[[package]]
-name = "wastewater"
-version = "0.1.0"
-source = { editable = "." }
-dependencies = [
-    { name = "anthropic" },
-    { name = "dash" },
-    { name = "dash-bootstrap-components" },
-    { name = "lightning" },
-    { name = "loguru" },
-    { name = "matplotlib" },
-    { name = "neuralforecast" },
-    { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
-    { name = "numpy", version = "2.4.4", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
-    { name = "pandas", version = "2.3.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
-    { name = "pandas", version = "3.0.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
-    { name = "plotly" },
-    { name = "pyarrow" },
-    { name = "pydantic" },
-    { name = "pydantic-settings" },
-    { name = "python-dotenv" },
-    { name = "requests" },
-    { name = "rich" },
-    { name = "scikit-learn", version = "1.7.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
-    { name = "scikit-learn", version = "1.8.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
-    { name = "seaborn" },
-    { name = "torch" },
-    { name = "tqdm" },
-]
-
-[package.optional-dependencies]
-dev = [
-    { name = "black" },
-    { name = "ipykernel" },
-    { name = "jupyter" },
-    { name = "mypy" },
-    { name = "pytest" },
-    { name = "pytest-cov" },
-    { name = "ruff" },
-]
-
-[package.dev-dependencies]
-dev = [
-    { name = "pytest-cov" },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "anthropic", specifier = ">=0.39.0" },
-    { name = "black", marker = "extra == 'dev'", specifier = ">=24.3.0" },
-    { name = "dash", specifier = ">=2.16.0" },
-    { name = "dash-bootstrap-components", specifier = ">=1.6.0" },
-    { name = "ipykernel", marker = "extra == 'dev'", specifier = ">=6.29.0" },
-    { name = "jupyter", marker = "extra == 'dev'", specifier = ">=1.0.0" },
-    { name = "lightning", specifier = ">=2.2.0" },
-    { name = "loguru", specifier = ">=0.7.0" },
-    { name = "matplotlib", specifier = ">=3.8.0" },
-    { name = "mypy", marker = "extra == 'dev'", specifier = ">=1.9.0" },
-    { name = "neuralforecast", specifier = ">=1.7.4" },
-    { name = "numpy", specifier = ">=1.26.0" },
-    { name = "pandas", specifier = ">=2.2.0" },
-    { name = "plotly", specifier = ">=5.20.0" },
-    { name = "pyarrow", specifier = ">=15.0.0" },
-    { name = "pydantic", specifier = ">=2.6.0" },
-    { name = "pydantic-settings", specifier = ">=2.2.0" },
-    { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.1.0" },
-    { name = "pytest-cov", marker = "extra == 'dev'", specifier = ">=5.0.0" },
-    { name = "python-dotenv", specifier = ">=1.0.0" },
-    { name = "requests", specifier = ">=2.31.0" },
-    { name = "rich", specifier = ">=13.7.0" },
-    { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.3.0" },
-    { name = "scikit-learn", specifier = ">=1.4.0" },
-    { name = "seaborn", specifier = ">=0.13.0" },
-    { name = "torch", specifier = ">=2.2.0" },
-    { name = "tqdm", specifier = ">=4.66.0" },
-]
-provides-extras = ["dev"]
-
-[package.metadata.requires-dev]
-dev = [{ name = "pytest-cov", specifier = ">=7.1.0" }]
 
 [[package]]
 name = "wcwidth"

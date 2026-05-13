@@ -53,11 +53,20 @@ def processed_df():
                     TARGET_COL: float(rng.exponential(1.5)),
                     "concentration": float(rng.exponential(5000)),
                     "population_served": float(rng.integers(50_000, 500_000)),
+                    "log1p_concentration": float(rng.normal(1.5, 0.3)),
                     "log1p_concentration_lag1w": float(rng.normal(1.5, 0.3)),
                     "log1p_concentration_lag2w": float(rng.normal(1.5, 0.3)),
                     "log1p_concentration_lag3w": float(rng.normal(1.5, 0.3)),
+                    "log1p_new_cases_lag1w": float(rng.normal(1.5, 0.3)),
+                    "log1p_new_cases_lag2w": float(rng.normal(1.5, 0.3)),
+                    "log1p_new_cases_lag3w": float(rng.normal(1.5, 0.3)),
                     "growth_rate_1w": float(rng.normal(0, 0.2)),
                     "relative_decay_rate": float(rng.uniform(-1.0, 1.0)),
+                    "diff_concentration": float(rng.normal(0, 0.1)),
+                    "log1p_concentration_2w_ma": float(rng.normal(1.5, 0.2)),
+                    "log1p_concentration_4w_ma": float(rng.normal(1.5, 0.2)),
+                    "log1p_concentration_2w_std": float(rng.uniform(0, 0.5)),
+                    "log1p_concentration_4w_std": float(rng.uniform(0, 0.5)),
                     "is_sludge": 1.0,
                     "outlier_flag": bool(rng.integers(0, 2)),
                     "sin_annual_1": float(np.sin(2 * np.pi * ds.dayofyear / 365.25)),
@@ -298,9 +307,9 @@ class TestBuildFutureDf:
     def test_output_shape(self, futr):
         assert len(futr) == 3 * 4   # 3 counties × 4 horizon steps
 
-    def test_dates_are_sundays(self, futr):
-        """pandas resample('W') anchors to Sunday (dayofweek = 6)."""
-        assert (futr["ds"].dt.dayofweek == 6).all()
+    def test_dates_are_wednesdays(self, futr):
+        """W-WED spine anchors to Wednesday (dayofweek = 2)."""
+        assert (futr["ds"].dt.dayofweek == 2).all()
 
     def test_all_counties_present(self, futr):
         assert set(futr["unique_id"].unique()) == {"06001", "06085", "06075"}

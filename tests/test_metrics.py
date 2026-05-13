@@ -541,6 +541,19 @@ class TestQuantileColumns:
         assert q.q025 == "TFT-lo-95.0"
         assert q.q50  == "TFT-median"
         assert q.q975 == "TFT-hi-95.0"
+        assert q.q10  is None
+        assert q.q90  is None
+
+    def test_auto_detect_with_seven_quantiles(self):
+        df = pd.DataFrame({
+            "TFT-lo-95.0": [1.0], "TFT-lo-80.0": [1.5],
+            "TFT-lo-50.0": [2.0], "TFT-median":  [3.0],
+            "TFT-hi-50.0": [4.0], "TFT-hi-80.0": [4.5],
+            "TFT-hi-95.0": [5.0],
+        })
+        q = QuantileColumns.auto_detect(df)
+        assert q.q10 == "TFT-lo-80.0"
+        assert q.q90 == "TFT-hi-80.0"
 
     def test_auto_detect_raises_for_missing_column(self):
         df = pd.DataFrame({"TFT-median": [1.0]})   # missing lo/hi columns
@@ -663,8 +676,8 @@ class TestExpandingWindowCvValSize:
 
         assert fit_calls, "model.fit() was never called"
         for call in fit_calls:
-            assert call["val_size"] == 2, (
-                f"Expected val_size=2 (horizon), got val_size={call['val_size']}"
+            assert call["val_size"] == 0, (
+                f"Expected val_size=0 (disabled for CV in Phase 2), got val_size={call['val_size']}"
             )
 
     def test_early_stopping_error_avoided(self):

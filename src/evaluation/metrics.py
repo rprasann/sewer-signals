@@ -70,32 +70,53 @@ class QuantileColumns:
     """Maps semantic quantile roles to the column names in a forecast DataFrame.
 
     Defaults match the output of ``PINNWastewaterLoss`` (MQLoss with
-    quantiles=[0.025, 0.25, 0.5, 0.75, 0.975]) wrapped in a ``TFT`` model.
-    The prefix is the model alias; NeuralForecast appends the output suffix.
+    quantiles=[0.025, 0.10, 0.25, 0.50, 0.75, 0.90, 0.975]) wrapped in a
+    ``TFT`` model.  The prefix is the model alias; NeuralForecast appends the
+    output suffix.
 
     Example column names: ``"TFT-lo-95.0"``, ``"TFT-median"``
+
+    ``q10`` and ``q90`` are optional: they are present when the TFT is
+    configured with 7 quantiles but absent in test fixtures and legacy runs
+    that used 5 quantiles.  When ``None``, the 80 % PI band is silently
+    skipped in display/inversion steps.
     """
 
-    q025: str = "TFT-lo-95.0"
-    q25:  str = "TFT-lo-50.0"
-    q50:  str = "TFT-median"
-    q75:  str = "TFT-hi-50.0"
-    q975: str = "TFT-hi-95.0"
+    q025: str       = "TFT-lo-95.0"
+    q10:  str | None = None           # 80 % PI lower (q=0.10) — populated by auto_detect
+    q25:  str       = "TFT-lo-50.0"
+    q50:  str       = "TFT-median"
+    q75:  str       = "TFT-hi-50.0"
+    q90:  str | None = None           # 80 % PI upper (q=0.90) — populated by auto_detect
+    q975: str       = "TFT-hi-95.0"
 
     @classmethod
     def auto_detect(cls, df: pd.DataFrame) -> "QuantileColumns":
-        """Infer column names by scanning the DataFrame for known suffixes."""
+        """Infer column names by scanning the DataFrame for known suffixes.
+
+        Required columns (q025, q25, q50, q75, q975) raise ``ValueError`` if
+        absent.  Optional columns (q10, q90) return ``None`` when absent so
+        that 5-quantile legacy forecasts remain compatible.
+        """
         cols = df.columns.tolist()
+
         def _find(suffix: str) -> str:
             matches = [c for c in cols if c.endswith(suffix)]
             if not matches:
                 raise ValueError(f"No column ending with '{suffix}' found in {cols}")
             return matches[0]
+
+        def _find_opt(suffix: str) -> str | None:
+            matches = [c for c in cols if c.endswith(suffix)]
+            return matches[0] if matches else None
+
         return cls(
             q025=_find("-lo-95.0"),
+            q10=_find_opt("-lo-80.0"),
             q25=_find("-lo-50.0"),
             q50=_find("-median"),
             q75=_find("-hi-50.0"),
+            q90=_find_opt("-hi-80.0"),
             q975=_find("-hi-95.0"),
         )
 
