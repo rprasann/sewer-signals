@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -m pytest tests/test_tft_model.py::TestToNfFormat::test_all_hist_covariates_present -v)"
+    ]
+  }
+}

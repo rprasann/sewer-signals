@@ -55,6 +55,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -98,6 +99,7 @@ from src.utils.helpers import (
     print_eval_report,
     setup_logger,
 )
+from src.utils.run_manager import snapshot_run, list_runs, RUNS_DIR
 from src.visualization.dashboard import create_app
 
 # ---------------------------------------------------------------------------
@@ -130,8 +132,23 @@ def _parse_args() -> argparse.Namespace:
         help="Export results without launching the Dash dashboard",
     )
     p.add_argument(
+        "--dash-only", action="store_true",
+        help=(
+            "Skip all pipeline steps and launch the dashboard directly from "
+            "the most recently exported parquets in data/processed/."
+        ),
+    )
+    p.add_argument(
         "--port", type=int, default=DASH_PORT,
         help="Dashboard server port",
+    )
+    p.add_argument(
+        "--run-name", type=str, default=None,
+        help=(
+            "Human-readable label for this run's snapshot (e.g. '3-County Phase4 v2'). "
+            "Every run is auto-snapshotted into data/runs/; this overrides the "
+            "default timestamp label."
+        ),
     )
     p.add_argument(
         "--counties", type=str, default=None,
@@ -406,16 +423,24 @@ def _validate_pipeline_inputs(
                 "using val_size instead of val_df for early stopping."
             )
 
-    # ── 3. NaN in HIST_COVARIATES (should be zero after _to_nf_format drops rows)
+    # ── 3. NaN in HIST_COVARIATES — summarise per split, log at DEBUG only.
+    # These are warmup rows at series start and cross-split boundaries; all
+    # dropped automatically by _to_nf_format.  Not actionable, not warnings.
+    nan_summary: list[str] = []
     for split_name, df in [("train", train_df), ("val", val_df), ("test", test_df)]:
-        for col in HIST_COVARIATES:
-            if col in df.columns:
-                n_nan = df[col].isna().sum()
-                if n_nan:
-                    issues.append(
-                        f"[INV-NAN] {n_nan} NaN values in '{col}' in {split_name} "
-                        f"— _to_nf_format will drop these rows automatically."
-                    )
+        affected_cols = {
+            col: int(df[col].isna().sum())
+            for col in HIST_COVARIATES
+            if col in df.columns and df[col].isna().any()
+        }
+        if affected_cols:
+            total_nan = sum(affected_cols.values())
+            nan_summary.append(
+                f"[INV-NAN] {split_name}: {total_nan} warmup NaN cells "
+                f"across {len(affected_cols)} features — dropped by _to_nf_format"
+            )
+    for msg in nan_summary:
+        logger.debug("Validation: {}", msg)
 
     # ── 4. FIPS consistency ───────────────────────────────────────────────────
     if COUNTY_COL in train_df.columns and COUNTY_COL in val_df.columns:
@@ -443,7 +468,10 @@ def _validate_pipeline_inputs(
             "pipeline will continue (all are handled automatically).[/yellow]"
         )
     else:
-        console.print("  [green]All checks passed.[/green]")
+        console.print(
+            "  [green]All checks passed.[/green]"
+            + (f"  ({len(nan_summary)} warmup-NaN splits suppressed — run with LOG_LEVEL=DEBUG to see)" if nan_summary else "")
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -494,6 +522,19 @@ def _invert_scaling_to_log1p(
     Inverse: log1p_val = scaled_val × scale + center
     Uses the scaler parameters fitted on TARGET_COL (log1p_new_cases).
     """
+    # If scalers were not fitted in this session (e.g. model loaded from disk),
+    # attempt to restore them from the persisted scalers.joblib file.
+    if not getattr(proc, "_scalers", None):
+        scaler_path = PROCESSED_DIR / "scalers.joblib"
+        if scaler_path.exists():
+            proc.load_scalers(scaler_path)
+        else:
+            logger.warning(
+                "Scaler unavailable and no scalers.joblib found — "
+                "columns left in scaled log1p space."
+            )
+            return df
+
     if proc._scaler is None or TARGET_COL not in proc._scale_cols:
         logger.warning("Scaler unavailable — columns left as scaled log1p.")
         return df
@@ -611,6 +652,37 @@ def main() -> None:
     setup_logger()
     cfg.settings = cfg.EnvSettings()
 
+    # ── --dash-only: skip all pipeline steps, load from last export ─────────
+    if args.dash_only:
+        console.rule("[bold white] Sewer Signals — Dashboard (from saved parquets) [/bold white]")
+        required = [PROCESSED_DIR / f for f in ("train.parquet", "val.parquet", "test.parquet", "forecast.parquet")]
+        missing  = [p.name for p in required if not p.exists()]
+        if missing:
+            logger.error(
+                "--dash-only requires exported parquets in {}.  Missing: {}.  "
+                "Run 'uv run main.py --no-dash' first.",
+                PROCESSED_DIR, missing,
+            )
+            raise SystemExit(1)
+        dash_processed = pd.concat(
+            [pd.read_parquet(PROCESSED_DIR / s) for s in ("train.parquet", "val.parquet", "test.parquet")],
+            ignore_index=True,
+        )
+        dash_forecast = pd.read_parquet(PROCESSED_DIR / "forecast.parquet")
+        dash_q_cols   = QuantileColumns.auto_detect(dash_forecast)
+        logger.info(
+            "Dashboard at http://localhost:{} — {} county-weeks, {} forecast rows",
+            args.port, len(dash_processed), len(dash_forecast),
+        )
+        app = create_app(
+            processed_df=dash_processed,
+            forecast_df=dash_forecast,
+            q_cols=dash_q_cols,
+            runs_dir=RUNS_DIR,
+        )
+        app.run(host=DASH_HOST, port=args.port, debug=DASH_DEBUG)
+        return
+
     skip_cv   = args.skip_cv or args.fast
     max_steps = 200 if args.fast else cfg.TFT_CONFIG["max_steps"]
     cv_steps  = min(max_steps, 500)
@@ -639,6 +711,11 @@ def main() -> None:
 
     # ── 2. Leakage-free processing  [INV-1, INV-3] ───────────────────────────
     proc, train_df, val_df, test_df = _process_sludge_track(raw_ww, raw_cases)
+    # Persist per-county RobustScaler state immediately after fitting so that
+    # any future session (notebook, dashboard reload, standalone inference) can
+    # invert the scaling without re-running the full pipeline.
+    PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
+    proc.save_scalers(PROCESSED_DIR / "scalers.joblib")
     # cv_data  = 50-week CV window (train + val)  → used for CV loop and final training
     # test_df  = 15-week holdout                  → never seen during CV or training
     cv_data    = pd.concat([train_df, val_df], ignore_index=True)
@@ -687,56 +764,94 @@ def main() -> None:
         sludge_all, forecast_df, proc, q_cols
     )
 
-    # ── 7. LLM public health bulletin (LM Studio) ────────────────────────────
-    vsn_weights = model.variable_importance()
-    if cfg.settings and cfg.settings.use_local_llm:
-        logger.info(
-            "Generating public health summary via LM Studio ({}) …",
-            cfg.settings.local_llm_base_url,
-        )
-        # LLM summary uses decoded case counts for human-readable numbers
-        forecast_cases = _build_decoded_forecast(forecast_df, proc, q_cols)
-        summary = generate_public_health_summary(
-            forecast_df=forecast_cases,
-            eval_result=eval_result,
-            vsn_weights=vsn_weights,
-            county_fips=list(BAY_AREA_FIPS.values()),
-            base_url=cfg.settings.local_llm_base_url,
-            model=cfg.settings.local_llm_model,
-        )
-        console.rule("[bold cyan] Public Health Summary [/bold cyan]")
-        console.print(summary)
-        (PROCESSED_DIR / "public_health_summary.txt").write_text(summary)
-    else:
-        logger.warning(
-            "Local LLM disabled — set USE_LOCAL_LLM=true in .env to enable.  "
-            "LM Studio must be running at {} with a model loaded.",
-            cfg.LOCAL_LLM_BASE_URL,
-        )
-
-    # ── 8. Export ─────────────────────────────────────────────────────────────
+    # ── 7. Export  [INV-2] ────────────────────────────────────────────────────
+    # Done BEFORE the optional LLM step so a missing dependency or network
+    # error can never erase a successful training run.
+    # Invert TARGET_COL scaling on all splits so every exported parquet has
+    # TARGET_COL in unscaled log1p space — identical to forecast_display.
+    train_display = _invert_scaling_to_log1p(train_df, proc, cols=[TARGET_COL])
+    val_display   = _invert_scaling_to_log1p(val_df,   proc, cols=[TARGET_COL])
+    test_display  = _invert_scaling_to_log1p(test_df,  proc, cols=[TARGET_COL])
     _export_results(
-        train_df, val_df, test_df,
-        forecast_display,  # export the display version (unscaled log1p)
+        train_display, val_display, test_display,
+        forecast_display,  # all four now in unscaled log1p space
         cv_df, eval_result,
     )
 
+    # ── 7b. Run snapshot ─────────────────────────────────────────────────────
+    # Always snapshot so the dashboard dropdown always has a fresh entry.
+    # --run-name provides a human-readable label; default is a timestamp.
+    _snap_label     = args.run_name if args.run_name else datetime.now().strftime("%Y%m%d_%H%M")
+    active_fips     = sorted(train_df[COUNTY_COL].unique().tolist())
+    active_counties = [cfg.FIPS_TO_COUNTY.get(f, f) for f in active_fips]
+    _run_id, _run_dir = snapshot_run(
+        proc_dir   = PROCESSED_DIR,
+        run_label  = _snap_label,
+        counties   = active_counties,
+        phase      = "Phase 4",
+        notes      = f"max_steps={max_steps}, skip_cv={skip_cv}",
+    )
+    console.print(f"  [bold green]Run snapshot saved:[/bold green] {_run_id}  →  {_run_dir}")
+
+    # ── 8. LLM public health bulletin (LM Studio) ────────────────────────────
+    vsn_weights = model.variable_importance()
+    if cfg.settings and cfg.settings.use_local_llm:
+        try:
+            logger.info(
+                "Generating public health summary via LM Studio ({}) …",
+                cfg.settings.local_llm_base_url,
+            )
+            forecast_cases = _build_decoded_forecast(forecast_df, proc, q_cols)
+            summary = generate_public_health_summary(
+                forecast_df=forecast_cases,
+                eval_result=eval_result,
+                vsn_weights=vsn_weights,
+                county_fips=list(BAY_AREA_FIPS.values()),
+                base_url=cfg.settings.local_llm_base_url,
+                model=cfg.settings.local_llm_model,
+            )
+            console.rule("[bold cyan] Public Health Summary [/bold cyan]")
+            console.print(summary)
+            (PROCESSED_DIR / "public_health_summary.txt").write_text(summary)
+        except ImportError as exc:
+            logger.warning("LLM summary skipped — {}.  Install 'openai' to enable.", exc)
+        except Exception as exc:
+            logger.warning("LLM summary skipped — {}", exc)
+    else:
+        logger.info(
+            "Local LLM disabled (USE_LOCAL_LLM not set).  "
+            "Set USE_LOCAL_LLM=true in .env and start LM Studio at {} to enable.",
+            cfg.LOCAL_LLM_BASE_URL,
+        )
+
     # ── 9. Dashboard  [INV-1, INV-2, INV-3 all satisfied] ────────────────────
     if not args.no_dash:
+        # Reload display frames from the just-exported parquets so the dashboard
+        # is guaranteed to show exactly the same data as the exported files.
+        # This avoids any in-memory state divergence between _build_display_frames
+        # and the dashboard render path.
+        dash_processed = pd.concat([
+            pd.read_parquet(PROCESSED_DIR / "train.parquet"),
+            pd.read_parquet(PROCESSED_DIR / "val.parquet"),
+            pd.read_parquet(PROCESSED_DIR / "test.parquet"),
+        ], ignore_index=True)
+        dash_forecast  = pd.read_parquet(PROCESSED_DIR / "forecast.parquet")
+        dash_q_cols    = QuantileColumns.auto_detect(dash_forecast)
+
         console.rule("[bold green] Launching Dash Dashboard [/bold green]")
         logger.info(
-            "Dashboard at http://localhost:{}  "
-            "(processed_display TARGET_COL = unscaled log1p; "
-            "forecast_display quantile cols = unscaled log1p)",
-            args.port,
+            "Dashboard at http://localhost:{} — data reloaded from parquets "
+            "(unscaled log1p; {} county-weeks, {} forecast rows)",
+            args.port, len(dash_processed), len(dash_forecast),
         )
         app = create_app(
-            processed_df=processed_display,   # actuals in unscaled log1p
-            forecast_df=forecast_display,     # forecasts in unscaled log1p
+            processed_df=dash_processed,      # actuals in unscaled log1p (from parquet)
+            forecast_df=dash_forecast,        # forecasts in unscaled log1p (from parquet)
             model=model,                      # fitted TFT for live attention/VSN
             sludge_df=sludge_all,             # has `concentration` col for two-track chart
             liquid_df=liquid_all,             # is_sludge=0.0, SECONDARY_UNIT  [INV-3]
-            q_cols=q_cols,
+            q_cols=dash_q_cols,
+            runs_dir=RUNS_DIR,               # enables run selector in dashboard
         )
         app.run(host=DASH_HOST, port=args.port, debug=DASH_DEBUG)
 

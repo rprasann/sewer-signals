@@ -82,6 +82,7 @@ from neuralforecast.models import TFT
 
 from src.config import (
     BAY_AREA_FIPS,
+    BAY_AREA_POPULATION,
     COUNTY_COL,
     LOGS_DIR,
     MODELS_DIR,
@@ -122,9 +123,9 @@ HIST_COVARIATES: list[str] = [
     "relative_decay_rate",        # WW 7-day relative change; captures surge & decay
     "outlier_flag_int",
     # Derivative expansion — velocity, acceleration, and rolling momentum (Phase 2/3)
-    "diff_concentration",             # 1st derivative: absolute weekly Δ (velocity)
-    "ww_accel",                       # 2nd derivative: Δ velocity (acceleration / inflection)
-    "diff_concentration_lag1w",       # velocity 1 week ago (momentum direction context)
+    "vel_concentration",               # 1st derivative: absolute weekly Δ (velocity)
+    "accel_concentration",            # 2nd derivative: Δ velocity (acceleration / inflection)
+    "vel_concentration_lag1w",        # velocity 1 week ago (momentum direction context)
     "log1p_concentration_2w_ma",      # 2-week rolling mean (short baseline)
     "log1p_concentration_4w_ma",      # 4-week rolling mean (medium baseline)
     "log1p_concentration_2w_std",     # 2-week rolling std (local volatility signal)
@@ -497,16 +498,31 @@ class WastewaterTFT:
                 .rename("population_served")
             )
         else:
-            logger.warning("population_served missing — log_population set to 0.")
+            logger.debug(
+                "population_served not in DataFrame — using 2020 Census county populations."
+            )
+            fips_list = df["unique_id"].unique()
             pop_per_county = pd.Series(
-                0.0,
-                index=df["unique_id"].unique(),
+                {fips: float(BAY_AREA_POPULATION.get(str(fips), 1.0)) for fips in fips_list},
                 name="population_served",
             )
 
         static = pop_per_county.reset_index()
         static.columns = ["unique_id", "population_served"]
         static["log_population"] = np.log1p(static["population_served"])
+        # Z-score log_population so it sits in the same ~[-2, +2] range as
+        # RobustScaled time-varying features.  Without this, log_population
+        # (~13–16 for Bay Area counties) is 6–50× larger than every other
+        # input, distorting VSN gradient signal toward the static channel.
+        # Self-contained: no scaler state needed; std is ~0 for a single county
+        # (1-county runs) → safely clamped to 0.
+        _pop_std = float(static["log_population"].std(ddof=0))
+        if _pop_std > 1e-6:
+            _pop_mean = float(static["log_population"].mean())
+            static["log_population"] = (static["log_population"] - _pop_mean) / _pop_std
+        else:
+            static["log_population"] = 0.0
+
         static["county_fips_encoded"] = static["unique_id"].map(
             lambda fips: float(_FIPS_INT.get(fips, -1))
         )

@@ -174,6 +174,82 @@ def extract_vsn_weights(
 
 
 # ---------------------------------------------------------------------------
+# VSN momentum audit (Phase 4)
+# ---------------------------------------------------------------------------
+
+# Features that should carry the burst/acceleration signal.
+# Importance below _MOMENTUM_MIN_IMPORTANCE triggers a warning.
+_MOMENTUM_FEATURES = (
+    "vel_concentration",
+    "accel_concentration",
+    "vel_concentration_lag1w",
+)
+_MOMENTUM_MIN_IMPORTANCE = 0.067  # ~1/15 = random baseline for 15 features
+
+
+def vsn_momentum_audit(
+    model: "WastewaterTFT",
+    feature_list: Optional[list[str]] = None,
+) -> Optional[dict[str, float]]:
+    """Extract VSN weights and warn when momentum features are below-chance.
+
+    Calls ``extract_vsn_weights`` on the fitted model, then checks whether
+    each momentum feature's normalised importance is above ``1/n_features``
+    (the random-chance baseline).  Logs a warning for any under-weighted
+    feature so the user knows before interpreting AUC results.
+
+    Parameters
+    ----------
+    model        : Fitted WastewaterTFT.
+    feature_list : Ordered list of HIST_COVARIATES fed to the model.
+                   If None, the function cannot map weight indices to names.
+
+    Returns
+    -------
+    Dict mapping feature name → normalised importance (0–1), or None on failure.
+    """
+    vsn = extract_vsn_weights(model)
+    if vsn is None:
+        logger.warning("VSN momentum audit: weight extraction returned None.")
+        return None
+
+    hist_weights = vsn.get("historical")
+    if hist_weights is None:
+        logger.warning("VSN momentum audit: no historical VSN weights found.")
+        return None
+
+    if feature_list is None:
+        logger.warning(
+            "VSN momentum audit: feature_list not provided; returning raw weights."
+        )
+        return {"raw": hist_weights.tolist()}
+
+    n = min(len(feature_list), len(hist_weights))
+    importance: dict[str, float] = {
+        feature_list[i]: float(hist_weights[i]) for i in range(n)
+    }
+
+    chance = 1.0 / n
+    for feat in _MOMENTUM_FEATURES:
+        imp = importance.get(feat)
+        if imp is None:
+            continue
+        if imp < chance:
+            logger.warning(
+                "VSN momentum audit: '{}' importance={:.4f} is BELOW chance ({:.4f}). "
+                "Consider checking feature scaling or adding derivative features.",
+                feat, imp, chance,
+            )
+        else:
+            logger.info(
+                "VSN momentum audit: '{}' importance={:.4f} (chance={:.4f}) ✓",
+                feat, imp, chance,
+            )
+
+    return importance
+
+
+# ---------------------------------------------------------------------------
 # Attention heatmap
 # ---------------------------------------------------------------------------
 
@@ -250,9 +326,9 @@ _COVARIATE_CATEGORY: dict[str, str] = {
     # Outbreak-phase dynamics
     "growth_rate_1w":            "Dynamics",
     "relative_decay_rate":       "Dynamics",
-    "diff_concentration":        "Dynamics",
-    "ww_accel":                  "Dynamics",
-    "diff_concentration_lag1w":  "Dynamics",
+    "vel_concentration":          "Dynamics",
+    "accel_concentration":       "Dynamics",
+    "vel_concentration_lag1w":   "Dynamics",
     "outlier_flag_int":          "QC Flag",
     "sin_annual_1":  "Seasonality", "cos_annual_1": "Seasonality",
     "sin_annual_2":  "Seasonality", "cos_annual_2": "Seasonality",

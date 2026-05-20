@@ -6,91 +6,117 @@
 
 ---
 
-## Current Phase: Phase 2 — "Momentum Pivot" (In Progress)
+## Current Phase: Phase 4 — "Heuristics to Dynamics" (Starting)
 
-**Objective:** Move from a "Smoothing Engine" to an "Outbreak Detection" model.
-The model must capture the suddenness and volatility of clinical case surges,
-not just the smooth inter-wave baseline.
+**Objective:** Replace the three hard-coded "magic numbers" that were validated
+in the Phase 3 PoC with dynamic, statistically-grounded computations. The
+goal is an auto-calibrating model that does not require manual threshold tuning
+when the data distribution shifts (new waves, new counties, new variants).
 
-**Last verified run:** `python main.py --skip-cv --no-dash` completed exit 0
-(2000 steps, MPS GPU, 4.4M parameter TFT). Holdout evaluation metrics not yet
-captured (run output was truncated). Full evaluation run is the immediate next step.
-
----
-
-## The Core Problem: "Zero Coverage" (The Overconfident Smoother)
-
-### Symptom
-- Holdout PI coverage: **0% at both 50% and 95% intervals**
-- The model's upper quantile (0.975) is consistently *below* actuals
-- Predictions are smooth, linear trajectories; reality is "spiky" week-over-week surges
-
-### Root Causes Identified and Addressed
-
-| Root Cause | Fix Applied | Status |
-|---|---|---|
-| Softplus in `domain_map` collapsed RobustScaled negatives to zero floor | Removed Softplus; `domain_map` is now identity reshape | ✅ Done |
-| `scaler_type="robust"` double-compressed variance | Changed to `scaler_type="identity"` | ✅ Done |
-| `GROWTH_RATE_LAMBDA=0.05` penalised surge trajectories | Reduced to 0.005, then **disabled (0.0)** for Phase 2 | ✅ Done |
-| Model lacked vocabulary for rate-of-change | Added 5 derivative/momentum features | ✅ Done (Phase 2) |
-| Quantile loss underdispersed (5 quantiles, equal horizon weighting) | Expanded to 7 quantiles + near-term horizon upweighting | ✅ Done (Phase 2) |
-
-### What Has NOT Been Verified Yet
-- Whether the Phase 2 changes actually improve holdout coverage (awaiting full run)
-- CV fold metrics with the new 15-feature set
+**Phase 3 Status:** ✅ Complete — PoC breakthrough confirmed on 3-county validation
+(San Francisco, San Mateo, Santa Clara). Hard-coded heuristics broke the
+"Smoothing Engine" and achieved non-zero PI coverage. Values are now the
+baseline to replace.
 
 ---
 
-## Phase 2 Changes — What Was Done This Session
+## The PoC Baseline (Phase 3 Hard-Coded Heuristics)
 
-### Task A: Derivative Expansion (5 new HIST_COVARIATES)
-Added to `processor._add_lag_features()` and `_apply_scaling()` candidates:
+These are the values that worked in Phase 3. Phase 4 must replace each one
+with a dynamic equivalent that achieves the same or better performance.
 
-| Feature | What it captures |
-|---|---|
-| `diff_concentration` | Absolute weekly velocity (Δ log1p_conc); distinct from relative `growth_rate_1w` |
-| `log1p_concentration_2w_ma` | 2-week rolling mean (short baseline for deviation detection) |
-| `log1p_concentration_4w_ma` | 4-week rolling mean (medium baseline) |
-| `log1p_concentration_2w_std` | Local volatility — spikes during erratic onset phase |
-| `log1p_concentration_4w_std` | Medium volatility window |
+| Constant | Value | Purpose | Phase 4 Replacement Target |
+|---|---|---|---|
+| `UNDERDISPERSION_LAMBDA` | `0.5` | Makes underdispersion penalty competitive with Pinball loss | **Scale-Aware Lambda**: `λ = k × mean_pinball_loss` |
+| `MIN_PI_WIDTH` | `2.5` | Minimum 95% PI width in scaled units (~86% of theoretical Gaussian width) | **Volatility-Adjusted Width**: `w = m × rolling_std(signal, 4w)` |
+| `OUTBREAK_GROWTH_THRESHOLD` | `0.25` | 25% WoW increase flags onset (Phase 3: lowered from 0.40 for AUC) | **Z-score / Percentile Trigger**: `z > Z_THRESHOLD` or `pct > P_THRESHOLD` |
 
-Total HIST_COVARIATES: **15** (was 10).
+---
 
-### Task B: Uncertainty Calibration
-Changes to `src/config.py` and `src/models/tft_model.py`:
+## Phase 4 Refactoring Targets
+
+### Target 1: Scale-Aware Lambda
+**Current:** `UNDERDISPERSION_LAMBDA = 0.5` (static)
+**Goal:** `λ_effective = k × mean_pinball_loss` where `k` is a dimensionless ratio
+(target: penalty ≈ 50% of base loss magnitude at initialisation).
+**Why static fails:** As Pinball loss drops during training, the underdispersion
+penalty increasingly dominates, eventually fighting the calibration it was meant
+to help.
+**Files to change:** `src/models/loss_functions.py`, `src/config.py`
+
+### Target 2: Volatility-Adjusted Minimum Width
+**Current:** `MIN_PI_WIDTH = 2.5` (static, in scaled units)
+**Goal:** `min_width_t = multiplier × σ_t` where σ_t is the 4-week rolling std
+of `log1p_concentration` for that county-week.
+**Why static fails:** A flat floor is too wide for low-variance periods (over-
+penalises) and too narrow for high-variance surge onsets (under-penalises).
+**Files to change:** `src/models/loss_functions.py`, `src/data_pipeline/processor.py`
+(add `rolling_std` as a passed-in covariate or compute inline in loss)
+
+### Target 3: Statistical Significance Outbreak Trigger
+**Current:** `OUTBREAK_GROWTH_THRESHOLD = 0.25` (static 25% WoW)
+**Goal:** Z-score relative to rolling baseline: `z = (x_t - μ_baseline) / σ_baseline`
+where baseline = 8-week rolling mean/std. Alert when `z > Z_THRESHOLD`.
+**Why static fails:** 25% growth is noise in a high-variance wave but significant
+in a quiet inter-wave period — same threshold, opposite meaning.
+**Files to change:** `src/evaluation/metrics.py`, `src/config.py`
+
+---
+
+## Phase 3 Summary (Completed)
+
+### What Phase 3 Did
+Phase 3 broke the "Smoothing Engine" by introducing an underdispersion penalty
+and two new derivative features. Validated on 3-county set.
 
 | Change | Before | After | File |
 |---|---|---|---|
-| PINN lambda | 0.005 | **0.0** (disabled) | `config.py` |
-| n_quantiles | 5 | **7** | `config.py` |
-| quantile_levels | [.025,.25,.5,.75,.975] | **[.025,.10,.25,.5,.75,.90,.975]** | `config.py` |
-| horizon_weight | None | **[2,2,1.5,1.5,1,1,.8,.8]** | `config.py` + `tft_model.py` |
+| Underdispersion penalty | None | `UNDERDISPERSION_LAMBDA=0.5` | `config.py` + `loss_functions.py` |
+| Minimum PI width | None | `MIN_PI_WIDTH=2.5` | `config.py` + `loss_functions.py` |
+| Outbreak threshold | 0.40 | **0.25** (higher AUC sensitivity) | `config.py` |
+| `accel_concentration` feature | Not present | 2nd derivative of log1p_concentration | `processor.py` + `tft_model.py` |
+| `vel_concentration_lag1w` | Not present | velocity 1 week ago | `processor.py` + `tft_model.py` |
+| HIST_COVARIATES count | 15 | **17** | `tft_model.py` |
+| Data end date | 2023-05-10 | **2023-12-19** (full CA dataset) | `config.py` |
+| Holdout window | 15 W (XBB peak only) | **28 W** (2023-06-08 → 2023-12-19) | `config.py` |
+| Validation set | 1-county (Santa Clara) | **3-county** (SF, San Mateo, SCC) | `config.py` |
 
-`horizon_weight` must be passed as `np.array(..., dtype=np.float32)` — NeuralForecast
-calls `.flatten()` on it internally; a plain Python list raises `AttributeError`.
+### Phase 3 Confirmed Working
+- Non-zero PI coverage on 3-county holdout ✅
+- `accel_concentration` and `vel_concentration_lag1w` in VSN with non-trivial weights ✅
+- Loss function compiles and trains without NaN ✅
 
-### Task C: "No Overlapping Pairs" Fix
-Already done in a prior session. `evaluate()` in `src/evaluation/metrics.py`
-returns a null `EvalResult` (all metrics NaN, `n_observations=0`) when forecast
-and actuals share no overlapping date pairs. No `ValueError` is raised.
+---
 
-### Dashboard: Operational Clarity Refactor
-`src/visualization/attention_plots.py` and `dashboard.py` — all visual changes:
+## Current Architecture Snapshot
 
-| Element | Before | After |
+### HIST_COVARIATES (17 features)
+
+| Group | Feature | Phase Added |
 |---|---|---|
-| Actuals colour | `#212121` (near-black, invisible on dark bg) | `#F5F5F5` (near-white) |
-| Forecast colour | `#9C27B0` (purple) | `#F97316` (orange) |
-| PI bands | purple rgba | orange rgba (30%/12%) |
-| Sludge track | `#2196F3` blue | `#38BDF8` sky blue |
-| Liquid track | `#FF9800` orange | `#C084FC` violet (avoids clash with forecast) |
-| Decay-rate axis | unlabelled | amber `#FDE68A` title + ticks |
-| Attention heatmap | Viridis | Plasma (stronger cold→hot contrast) |
-| Title font | 16px | 18px |
-| Axis label font | 13px | 14px |
-| Case momentum (VSN) | "Lag" category | "Case Lag" (orange = matches forecast) |
+| WW signal | `log1p_concentration` | 1 |
+| WW lags | `log1p_concentration_lag1w/2w/3w` | 1 |
+| Case momentum | `log1p_new_cases_lag1w/2w/3w` | 2 |
+| Slope/phase | `growth_rate_1w`, `relative_decay_rate`, `outlier_flag_int` | 1/2 |
+| Velocity | `vel_concentration` | 2 |
+| Acceleration | `accel_concentration` | 3 |
+| Momentum context | `vel_concentration_lag1w` | 3 |
+| Rolling baseline | `log1p_concentration_2w_ma`, `log1p_concentration_4w_ma` | 2 |
+| Local volatility | `log1p_concentration_2w_std`, `log1p_concentration_4w_std` | 2 |
 
-Dashboard changes are **not visible** in a currently running server — restart required.
+### Key Config Values (current state entering Phase 4)
+
+| Parameter | Value |
+|---|---|
+| `UNDERDISPERSION_LAMBDA` | 0.5 (static — Phase 4 target) |
+| `MIN_PI_WIDTH` | 2.5 (static — Phase 4 target) |
+| `OUTBREAK_GROWTH_THRESHOLD` | 0.25 (static — Phase 4 target) |
+| `GROWTH_RATE_LAMBDA` | 0.0 (PINN disabled) |
+| `n_quantiles` | 7 |
+| `quantile_levels` | [0.025, 0.10, 0.25, 0.50, 0.75, 0.90, 0.975] |
+| `horizon_weight` | [2.0, 2.0, 1.5, 1.5, 1.0, 1.0, 0.8, 0.8] |
+| `scaler_type` | "identity" |
+| Holdout window | 2023-06-08 → 2023-12-19 (28 W) |
 
 ---
 
@@ -98,55 +124,57 @@ Dashboard changes are **not visible** in a currently running server — restart 
 
 ### 1. Liquid-track NaN scaler warning
 When liquid-track is processed, `TARGET_COL` (`log1p_new_cases`) is all-NaN.
-`RobustScaler` raises `RuntimeWarning: All-NaN slice encountered`. This is expected
-and harmless — the scaler skips those columns. The target lag features
-(`log1p_new_cases_lag1w/2w/3w`) are not computed on the liquid track (guarded by
-`if TARGET_COL in df.columns and df[TARGET_COL].notna().any()`).
+`RobustScaler` raises `RuntimeWarning: All-NaN slice encountered`. Expected and
+harmless — the scaler skips those columns.
 
 ### 2. Warmup NaN warnings at pre-flight validation
 `_to_nf_format` drops rows with NaN hist_exog columns. The pre-flight checker
 in `main.py` logs ~25 `[INV-NAN]` warnings for warmup NaN rows (first 1–3 rows
-per county per lag/diff feature). This is expected and handled automatically.
+per county per lag/diff feature). Expected and handled automatically.
 
 ### 3. Short-history counties (Napa, Solano, Sonoma, Marin, Contra Costa)
-5 counties have fewer than `INPUT_SIZE + H = 34` training weeks.
-`start_padding_enabled=True` zero-pads them. These counties produce valid
-predictions but with lower reliability — VSN will assign low weight to their
-sparse early-history context window.
+5 counties have fewer than `INPUT_SIZE + H = 34` training weeks in early folds.
+`start_padding_enabled=True` zero-pads them.
 
 ### 4. CV models use `val_size=0` + `early_stop_patience_steps=-1`
-In `expanding_window_cv`, the model is fitted with `val_size=0` to avoid
-NeuralForecast's constraint `val_size ∈ {0} ∪ [h, ∞)`. Early stopping is
-disabled (via `cv_trainer_kwargs` passed through `WastewaterTFT`) so that
-`val_size=0` is accepted. CV evaluation is done externally by `evaluate()`.
+`expanding_window_cv` fits with `val_size=0` to satisfy NeuralForecast's
+`val_size ∈ {0} ∪ [h, ∞)` constraint. Early stopping disabled via
+`cv_trainer_kwargs`. CV evaluation done externally by `evaluate()`.
 
 ### 5. Rich progress bar nesting conflict
-If `enable_progress_bar=True` is set in CV trainer kwargs, PyTorch Lightning's
-`RichProgressBar` nests inside the outer Rich `Progress` context, draining the
-`_live_stack` and causing `IndexError: pop from empty list`. Always pass
+If `enable_progress_bar=True` in CV trainer kwargs, PyTorch Lightning's
+`RichProgressBar` nests inside the outer Rich `Progress` context, causing
+`IndexError: pop from empty list`. Always pass
 `enable_progress_bar=False, enable_model_summary=False` in `cv_trainer_kwargs`.
+
+### 6. `horizon_weight` must be np.array dtype float32
+NeuralForecast calls `.flatten()` on `horizon_weight` internally.
+A plain Python list raises `AttributeError`. Always pass
+`np.array([...], dtype=np.float32)`.
 
 ---
 
-## Immediate Next Steps
+## Immediate Next Steps (Phase 4)
 
-1. **Run full evaluation:** `python main.py --skip-cv --no-dash`
-   Capture holdout `coverage_50`, `coverage_95`, `mean_wis`, `smape`.
-   Target: coverage_95 > 50% (any non-zero improvement from 0%).
+1. **Analysis — understand heuristic coupling:** Before replacing any constant,
+   run `python main.py --skip-cv --no-dash` to get a clean baseline metric
+   snapshot (coverage_50, coverage_95, mean_wis, smape, AUC).
 
-2. **If coverage still 0%:** Inspect whether the issue is in `_build_decoded_forecast`
-   — the inverse_transform + expm1 + clip chain may be collapsing the quantile spread.
-   Debug by logging raw (scaled) quantile spread vs. decoded spread.
+2. **Target 1 — Scale-Aware Lambda:** Implement `λ_effective` as a function of
+   running mean Pinball loss in `PINNWastewaterLoss.forward()`. Add
+   `UNDERDISPERSION_K` ratio constant to `config.py`.
 
-3. **Run full CV:** `python main.py --no-dash`
-   Verify all 5 folds complete without crashes and produce non-NaN WIS.
+3. **Target 2 — Volatility-Adjusted Width:** Compute `σ_t` from
+   `log1p_concentration_4w_std` (already in HIST_COVARIATES). Pass it into
+   the loss via the batch tensor; replace scalar `MIN_PI_WIDTH` with
+   per-sample `min_width_t = multiplier × σ_t`.
 
-4. **VSN interpretability check:** After a successful training run, verify that
-   `diff_concentration` and the `log1p_new_cases_lag*` features appear in the
-   VSN attention weights with non-trivial importance (> random 1/15 ≈ 6.7%).
+4. **Target 3 — Z-score Trigger:** Replace `OutbreakDetector` growth threshold
+   with a rolling z-score in `metrics.py`. Add `Z_OUTBREAK_THRESHOLD` to
+   `config.py`; deprecate `OUTBREAK_GROWTH_THRESHOLD`.
 
-5. **Dashboard end-to-end test:** Run `python main.py` (with dash) and verify
-   the new orange forecast / near-white actuals palette is correct in browser.
+5. **Regression check:** After each target, re-run evaluation and confirm
+   coverage_95 ≥ Phase 3 baseline.
 
 ---
 
@@ -168,16 +196,49 @@ python main.py --max-steps 500 --no-dash
 
 ---
 
-## File Change Log (this session and prior sessions)
+## Notebook Plotting Style Guide
 
-| File | What changed |
+**Library:** matplotlib + seaborn (NOT Plotly — static images preferred over interactive)
+
+**Theme setup (every notebook):**
+```python
+sns.set_theme(style="whitegrid", font_scale=1.1)
+plt.rcParams.update({"figure.dpi": 120, "axes.titlesize": 13, "axes.labelsize": 11, "legend.fontsize": 9})
+```
+
+**Color palette — Bay Area (blue / cherry-red / orange):**
+- `C_WW = "steelblue"` — wastewater signal
+- `C_CASES = "crimson"` — clinical cases
+- `C_ACCENT = "darkorange"` — forecast / accent
+
+**Title format:**
+```python
+fig.suptitle("Specific Descriptive Title — What Is Featured\nSubtitle: key details (county filter, units, transform)", fontsize=13, fontweight="bold")
+```
+
+**Axes:** always labeled with units — `ax.set_xlabel("Date (W-WED)", fontsize=10)` / `ax.set_ylabel("Copies/g (log)", fontsize=10)`
+
+**Legend:** `ax.legend(fontsize=9, loc="upper right")` — inside plot, top-right corner
+
+**Wave context bands:** `ax.axvspan(pd.Timestamp(ws), pd.Timestamp(we), alpha=0.07, color=wc, zorder=0)` using `ALL_WAVE_SPANS`
+
+**Dual-axis plots:** `ax.twinx()` — WW (`C_WW`) on left axis, cases (`C_CASES`) on right axis
+
+**Close every figure:** `plt.tight_layout()` then `plt.show()`
+
+---
+
+## File Change Log
+
+| File | Last significant change |
 |---|---|
-| `src/config.py` | TARGET_COL/WW_FEATURE_COL pivot; overlap dates; W-WED splits; 7 quantiles; λ=0.0; horizon_weight; scaler_type=identity |
-| `src/data_pipeline/processor.py` | Cases merge (Stage 12); W-WED resample; lag features for WW+target; derivative expansion (5 features); scaler candidates updated |
-| `src/models/tft_model.py` | HIST_COVARIATES 10→15; horizon_weight wired to loss; early_stop popped from trainer_kwargs for CV |
-| `src/models/loss_functions.py` | Softplus removed from domain_map; GROWTH_RATE_LAMBDA inline docs updated |
-| `src/evaluation/metrics.py` | evaluate() no-overlap guard (null EvalResult); CV freq="4W-WED"; val_size=0 |
-| `src/visualization/attention_plots.py` | Full colour palette refactor; Task C fonts/legend; Plasma heatmap; two-track axis colour-coding; VSN category map updated |
-| `src/visualization/dashboard.py` | Accent colour updated to match forecast orange |
-| `src/utils/helpers.py` | LLM prompt updated for new target (cases, not WW concentration) |
-| `main.py` | cv_trainer_kwargs (progress bar off, early stop -1); _split_raw overlap window; cases CSV loading; _run_cv wiring |
+| `src/config.py` | Phase 3: UNDERDISPERSION_LAMBDA=0.5, MIN_PI_WIDTH=2.5, OUTBREAK_GROWTH_THRESHOLD=0.25, data dates extended to 2023-12-19 |
+| `src/data_pipeline/processor.py` | Phase 3: accel_concentration + vel_concentration_lag1w added |
+| `src/models/tft_model.py` | Phase 3: HIST_COVARIATES 15→17 (accel_concentration, vel_concentration_lag1w) |
+| `src/models/loss_functions.py` | **Phase 4**: cumulative-softplus domain_map (monotonicity); fallback floor restored to MIN_PI_WIDTH=2.5 |
+| `src/data_pipeline/processor.py` | **Phase 4**: save_scalers() / load_scalers() — scaler persistence to disk |
+| `main.py` | **Phase 4**: proc.save_scalers() after processing; _invert_scaling_to_log1p auto-loads; all exports in unscaled log1p |
+| `src/evaluation/metrics.py` | Phase 3: OUTBREAK_GROWTH_THRESHOLD=0.25; no-overlap guard |
+| `src/visualization/attention_plots.py` | Phase 2: Full colour palette refactor |
+| `src/visualization/dashboard.py` | Phase 2: Accent colour updated |
+| `src/utils/helpers.py` | Phase 2: LLM prompt updated for case target |

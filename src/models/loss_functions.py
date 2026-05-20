@@ -4,23 +4,40 @@ Custom loss functions for wastewater probabilistic forecasting.
 Architecture
 ------------
 PINNWastewaterLoss (MQLoss subclass)
-  ├── domain_map()   — identity reshape only → raw logits → [B,H,N,Q]
-  ├── __call__()     — Pinball (MQLoss) + PINN growth-rate penalty
-  └── _growth_penalty() — weak regulariser on median step-rate violations
+  ├── domain_map()         — median-anchored cumulative softplus → [B,H,N,Q]
+  ├── __call__()           — Pinball (MQLoss) + underdispersion penalty
+  └── _underdispersion_penalty() — penalises PI narrower than volatility floor
 
-Design notes (calibration pivot)
----------------------------------
-Softplus was removed from domain_map.  The target is log1p_new_cases scaled
-by the processor's RobustScaler; values are legitimately negative (below-median
-weeks).  Forcing non-negativity via Softplus collapsed all quantile outputs
-toward the Softplus floor → near-zero quantile spread → 0% PI coverage.
-Non-negativity is enforced post-hoc in _build_decoded_forecast via expm1+clip.
+Design notes (Phase 4 domain_map)
+-----------------------------------
+The median (Q[0.50]) is the unconstrained raw output.  All other quantiles are
+built symmetrically via cumulative softplus:
 
-GROWTH_RATE_LAMBDA is reduced from 0.05 → 0.005.  The original lambda was
-calibrated for copies/g WW concentrations; for RobustScaled case counts it
-acted as a strong smoothing prior that suppressed outbreak spikes.  The reduced
-lambda keeps the biological-plausibility spirit and preserves the penalty signal
-in VSN attention weights without flattening prediction intervals.
+    lower: Q[0.25] = median − softplus(d2)
+           Q[0.10] = median − softplus(d2) − softplus(d1)
+           Q[0.025]= median − softplus(d2) − softplus(d1) − softplus(d0)
+
+    upper: Q[0.75] = median + softplus(d3)
+           Q[0.90] = median + softplus(d3) + softplus(d4)
+           Q[0.975]= median + softplus(d3) + softplus(d4) + softplus(d5)
+
+Why median as anchor (not Q[0.025]):
+  • The pinball gradient at Q[0.50] is τ = 0.5 — the largest among all
+    quantile levels.  Every training sample contributes equally, so the
+    median is the most strongly constrained output and stays close to the
+    true conditional median of the data.
+  • With a Q[0.025] anchor the optimizer has to balance two weak signals
+    (τ = 0.025 pinball + underdispersion penalty on PI width).  The
+    resulting equilibrium shifts the anchor — and therefore ALL quantiles —
+    far above the data distribution, producing the "forecast jump" at the
+    context boundary.
+  • With a median anchor the underdispersion penalty controls the spread
+    (increment sizes) without moving the level.  The median tracks the
+    data; the PI width floats symmetrically around it.
+
+GROWTH_RATE_LAMBDA is kept at 0.0 to isolate the underdispersion penalty and
+monotonicity dynamics.  The dynamic step-change cap infrastructure is wired and
+ready; set GROWTH_RATE_LAMBDA > 0 in config.py once median magnitude is stable.
 
 Standalone modules (PinballLoss, GrowthRatePenalty) are kept for unit tests and
 any direct PyTorch usage outside NeuralForecast.
@@ -30,14 +47,21 @@ from __future__ import annotations
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+from loguru import logger
 
 from neuralforecast.losses.pytorch import MQLoss
 
 from src.config import (
     GROWTH_RATE_LAMBDA,
     MAX_DAILY_GROWTH_RATE,
+    MAX_WEEKLY_STEP_CHANGE,
     MIN_PI_WIDTH,
+    MIN_PI_WIDTH_FLOOR,
+    MIN_PI_WIDTH_MULTIPLIER,
     QUANTILE_LEVELS,
+    STEP_CHANGE_MULTIPLIER,
+    UNDERDISPERSION_K,
     UNDERDISPERSION_LAMBDA,
 )
 
@@ -136,10 +160,11 @@ class PINNWastewaterLoss(MQLoss):
 
     domain_map
     ~~~~~~~~~~
-    Performs the standard MQLoss reshape ``[B, H, N*Q] → [B, H, N, Q]`` with
-    no activation.  Softplus was removed because the target (log1p_new_cases)
-    is RobustScaler-standardised and can be legitimately negative; see module
-    docstring for full rationale.
+    Median-anchored cumulative softplus.  Q[0.50] is the unconstrained raw
+    output; lower quantiles are built downward from it and upper quantiles
+    upward, each via softplus increments.  Monotonicity is guaranteed by
+    construction and the median stays tightly anchored to the data
+    distribution (τ=0.5 pinball gradient dominates).  See module docstring.
 
     Growth-rate penalty
     ~~~~~~~~~~~~~~~~~~~
@@ -154,11 +179,21 @@ class PINNWastewaterLoss(MQLoss):
     plausibility signal in VSN attention weights without flattening PI spread.
 
     Args:
-        quantiles:            Sorted quantile levels; must include 0.5.
-        growth_lambda:        Weight of the PINN penalty (default 0.005).
-        max_daily_growth_rate: Per-day biological ceiling; scaled by data_freq_days.
-        data_freq_days:       Days per model time-step (7 for weekly data).
-        horizon_weight:       Optional per-step horizon weighting passed to MQLoss.
+        quantiles:               Sorted quantile levels; must include 0.5.
+        growth_lambda:           Weight of the PINN penalty (0.0 = disabled).
+        max_daily_growth_rate:   Per-day biological ceiling; scaled by data_freq_days.
+        data_freq_days:          Days per model time-step (7 for weekly data).
+        max_step_change:         Static floor / fallback for the growth-rate cap (scaled units).
+        step_change_multiplier:  Phase 4 — dyn_cap = multiplier × σ(y_insample[-4:]),
+                                 clamped to min=max_step_change.  Parallel to
+                                 min_pi_width_multiplier for the underdispersion penalty.
+        horizon_weight:          Optional per-step horizon weighting passed to MQLoss.
+        underdispersion_k:       Phase 4 — ratio K so effective_lambda = K × pinball_loss.
+                                 Keeps the penalty proportional to base loss magnitude.
+        min_pi_width_multiplier: Phase 4 — min_width_t = multiplier × σ(y_insample[-4:]).
+        min_pi_width_floor:      Absolute minimum width floor (scaled units).
+        underdispersion_lambda:  Phase 3 legacy (ignored when underdispersion_k > 0).
+        min_pi_width:            Phase 3 legacy (ignored when min_pi_width_multiplier > 0).
     """
 
     def __init__(
@@ -167,13 +202,26 @@ class PINNWastewaterLoss(MQLoss):
         growth_lambda: float = GROWTH_RATE_LAMBDA,
         max_daily_growth_rate: float = MAX_DAILY_GROWTH_RATE,
         data_freq_days: int = _DATA_FREQ_DAYS,
+        max_step_change: float = MAX_WEEKLY_STEP_CHANGE,
+        step_change_multiplier: float = STEP_CHANGE_MULTIPLIER,
         horizon_weight=None,
+        underdispersion_k: float = UNDERDISPERSION_K,
+        min_pi_width_multiplier: float = MIN_PI_WIDTH_MULTIPLIER,
+        min_pi_width_floor: float = MIN_PI_WIDTH_FLOOR,
         underdispersion_lambda: float = UNDERDISPERSION_LAMBDA,
         min_pi_width: float = MIN_PI_WIDTH,
     ) -> None:
         super().__init__(quantiles=quantiles, horizon_weight=horizon_weight)
         self.growth_lambda = growth_lambda
         self.max_step_growth_rate: float = max_daily_growth_rate * data_freq_days
+        # Phase 4: dynamic step-change cap — floor when y_insample unavailable
+        self.max_step_change: float = max_step_change
+        self.step_change_multiplier: float = step_change_multiplier
+        # Phase 4 adaptive parameters
+        self.underdispersion_k = underdispersion_k
+        self.min_pi_width_multiplier = min_pi_width_multiplier
+        self.min_pi_width_floor = min_pi_width_floor
+        # Phase 3 legacy (kept for backward compat / ablations)
         self.underdispersion_lambda = underdispersion_lambda
         self.min_pi_width = min_pi_width
 
@@ -186,16 +234,64 @@ class PINNWastewaterLoss(MQLoss):
         self._lower_idx: int | None = sorted_qs.index(0.025) if 0.025 in sorted_qs else None
         self._upper_idx: int | None = sorted_qs.index(0.975) if 0.975 in sorted_qs else None
 
+        # Fires once on the first forward pass to confirm whether NeuralForecast
+        # passes y_insample to our __call__.  Determines whether Phase 4 dynamic
+        # features (_dynamic_min_width, _growth_penalty dynamic cap) are live.
+        self._y_insample_logged: bool = False
+
     # ------------------------------------------------------------------
     # domain_map — called by NeuralForecast *before* __call__
     # ------------------------------------------------------------------
 
     def domain_map(self, y_hat: torch.Tensor) -> torch.Tensor:
-        """Reshape raw logits to ``[B, H, N, Q]`` — no activation applied.
+        """Reshape raw logits to ``[B, H, N, Q]`` with median-anchored monotonicity.
 
-        Softplus removed; see module docstring for rationale.
+        Q[0.50] is the unconstrained raw output — the pinball gradient at τ=0.5
+        is the strongest of all quantile levels, keeping the median tightly
+        anchored to the true data distribution.
+
+        Lower quantiles are built downward from the median via reverse-cumsum of
+        softplus increments; upper quantiles are built upward the same way:
+
+            Q[0.25]  = median − softplus(d₂)
+            Q[0.10]  = median − softplus(d₂) − softplus(d₁)
+            Q[0.025] = median − softplus(d₂) − softplus(d₁) − softplus(d₀)
+
+            Q[0.75]  = median + softplus(d₃)
+            Q[0.90]  = median + softplus(d₃) + softplus(d₄)
+            Q[0.975] = median + softplus(d₃) + softplus(d₄) + softplus(d₅)
+
+        Monotonicity (Q[i] ≤ Q[i+1]) is guaranteed by construction because every
+        increment is strictly positive.  At random initialisation (all delta
+        logits = 0, softplus(0) ≈ 0.693), the PI spans 2 × 3 × 0.693 ≈ 4.16
+        scaled units, centred symmetrically on the median.  The underdispersion
+        penalty then widens/narrows this spread without displacing the level.
         """
-        return super().domain_map(y_hat)
+        reshaped = super().domain_map(y_hat)            # [B, H, N, Q] — reshape only
+
+        # Median: unconstrained anchor at position median_idx (=3 for 7-quantile setup)
+        median = reshaped[..., self.median_idx : self.median_idx + 1]  # [B, H, N, 1]
+
+        # ── Lower quantiles (Q[0.025], Q[0.10], Q[0.25]) ────────────────────
+        # lower_deltas[..., 0] → leftmost (Q[0.025]), furthest from median
+        # lower_deltas[..., 2] → rightmost (Q[0.25]),  closest to median
+        lower_deltas = reshaped[..., : self.median_idx]                # [B, H, N, 3]
+        lower_incs   = F.softplus(lower_deltas)                        # all > 0
+
+        # Reverse-prefix-sum: lower_cumsum[..., k] = sum of incs from k to end
+        # so that Q[0.025] = median − (inc₀+inc₁+inc₂) and Q[0.25] = median − inc₂
+        lower_cumsum = torch.flip(
+            torch.cumsum(torch.flip(lower_incs, dims=[-1]), dim=-1),
+            dims=[-1],
+        )                                                               # [B, H, N, 3]
+        lower_qs = median - lower_cumsum                               # [B, H, N, 3]
+
+        # ── Upper quantiles (Q[0.75], Q[0.90], Q[0.975]) ────────────────────
+        upper_deltas = reshaped[..., self.median_idx + 1 :]            # [B, H, N, 3]
+        upper_incs   = F.softplus(upper_deltas)                        # all > 0
+        upper_qs = median + torch.cumsum(upper_incs, dim=-1)           # [B, H, N, 3]
+
+        return torch.cat([lower_qs, median, upper_qs], dim=-1)         # [B, H, N, Q]
 
     # ------------------------------------------------------------------
     # __call__ — receives y_hat already shaped [B, H, N, Q]
@@ -208,47 +304,136 @@ class PINNWastewaterLoss(MQLoss):
         y_insample=None,
         mask=None,
     ) -> torch.Tensor:
-        """Pinball loss + PINN growth-rate penalty.
+        """Pinball loss + PINN growth-rate penalty + adaptive underdispersion penalty.
 
         Parameters
         ----------
-        y     : ``[B, H, N]``    ground-truth outsample values
-        y_hat : ``[B, H, N, Q]`` predicted quantiles (post domain_map)
+        y          : ``[B, H, N]``    ground-truth outsample values
+        y_hat      : ``[B, H, N, Q]`` predicted quantiles (post domain_map)
+        y_insample : ``[B, T, N]``    historical target values (used for dynamic PI width)
         """
+        if not self._y_insample_logged:
+            if y_insample is not None:
+                logger.info(
+                    "y_insample RECEIVED — Phase 4 dynamic features LIVE "
+                    "(shape={}, dtype={}).",
+                    tuple(y_insample.shape),
+                    y_insample.dtype,
+                )
+            else:
+                logger.warning(
+                    "y_insample ABSENT — Phase 4 dynamic features inactive; "
+                    "_dynamic_min_width and _growth_penalty using static fallbacks "
+                    "(min_pi_width={}, max_step_change={}).",
+                    self.min_pi_width,
+                    self.max_step_change,
+                )
+            self._y_insample_logged = True
+
         pinball = super().__call__(
             y=y, y_hat=y_hat, y_insample=y_insample, mask=mask
         )
-        pinn = self._growth_penalty(y_hat)
-        underdispersion = self._underdispersion_penalty(y_hat)
+        # Phase 4: effective lambda scales with current pinball magnitude so the
+        # underdispersion penalty stays proportional throughout training.
+        effective_lambda = self.underdispersion_k * pinball.detach()
+        dyn_min_width = self._dynamic_min_width(y_insample, y_hat.device, y_hat.dtype)
+        pinn = self._growth_penalty(y_hat, y_insample=y_insample)
+        underdispersion = self._underdispersion_penalty(y_hat, effective_lambda, dyn_min_width)
         return pinball + pinn + underdispersion
 
     # ------------------------------------------------------------------
     # Private helpers
     # ------------------------------------------------------------------
 
-    def _growth_penalty(self, y_hat: torch.Tensor) -> torch.Tensor:
-        """Quadratic penalty on median step-rate violations.
+    def _growth_penalty(
+        self,
+        y_hat: torch.Tensor,
+        y_insample=None,
+    ) -> torch.Tensor:
+        """Soft quadratic penalty on absolute median step-changes above a dynamic cap.
+
+        The cap adapts to per-sample insample volatility, mirroring _dynamic_min_width:
+
+            dyn_cap_t = STEP_CHANGE_MULTIPLIER × σ(y_insample[-4:])
+                        clamped to min=max_step_change  (static floor / fallback)
+
+        Behaviour by regime:
+          - calm inter-wave (σ ≈ 0.3): cap ≈ 3×0.3 = 0.9 → clamped to 1.5 (tight)
+          - surge onset     (σ ≈ 0.8): cap ≈ 3×0.8 = 2.4 → wider, tracks legitimate moves
+          - peak            (σ ≈ 1.5): cap ≈ 3×1.5 = 4.5 → wide open at peak volatility
+
+        Falls back to ``max_step_change`` (static) when ``y_insample`` is None.
+        Returns 0 when growth_lambda == 0.
 
         Parameters
         ----------
-        y_hat : ``[B, H, N, Q]`` — quantile predictions (post Softplus)
+        y_hat      : ``[B, H, N, Q]`` — monotone quantile predictions (post domain_map)
+        y_insample : ``[B, T, N]`` or ``[B, T]`` — historical target values (optional)
         """
-        median = y_hat[:, :, :, self.median_idx]            # (B, H, N)
-        denom = median[:, :-1, :].abs() + 1e-6
-        step_rate = (median[:, 1:, :] - median[:, :-1, :]) / denom  # (B, H-1, N)
-        violation = torch.clamp(step_rate - self.max_step_growth_rate, min=0.0)
+        if self.growth_lambda == 0.0:
+            return torch.zeros(1, device=y_hat.device, dtype=y_hat.dtype).squeeze()
+
+        # --- Dynamic cap: step_change_multiplier × local volatility ---------------
+        if y_insample is not None and self.step_change_multiplier > 0:
+            ys = y_insample.squeeze(-1) if y_insample.dim() == 3 else y_insample  # [B, T]
+            n_steps = min(4, ys.shape[1])
+            vol = ys[:, -n_steps:].float().std(dim=1, keepdim=True)   # [B, 1]
+            vol = torch.nan_to_num(vol, nan=0.0)
+            dyn_cap = (self.step_change_multiplier * vol).clamp(min=self.max_step_change)
+            dyn_cap = dyn_cap.unsqueeze(-1)    # [B, 1, 1] — broadcasts over H-1 and N
+        else:
+            dyn_cap = self.max_step_change     # scalar fallback
+
+        median = y_hat[:, :, :, self.median_idx]               # (B, H, N)
+        step_change = median[:, 1:, :] - median[:, :-1, :]     # (B, H-1, N) absolute Δ
+        violation = torch.clamp(step_change - dyn_cap, min=0.0)
         return self.growth_lambda * (violation ** 2).mean()
 
-    def _underdispersion_penalty(self, y_hat: torch.Tensor) -> torch.Tensor:
-        """Quadratic penalty when the predicted 95% PI is narrower than min_pi_width.
+    def _dynamic_min_width(
+        self,
+        y_insample,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """Compute per-sample dynamic minimum PI width from insample volatility.
 
-        Encourages the model to maintain a minimum quantile spread, preventing
-        the overconfident-smoother failure mode (0% PI coverage) where the
-        upper quantile stays consistently below the actuals.
+        Uses the std of the last 4 insample steps as a local volatility proxy.
+        Returns a ``[B, 1, 1]`` tensor that broadcasts over H and N dimensions.
+        Falls back to ``min_pi_width_floor`` when y_insample is None or too short.
+        """
+        if y_insample is None or self.min_pi_width_multiplier <= 0:
+            # Fall back to the Phase 3 static floor (2.5), not min_pi_width_floor (0.5).
+            # When y_insample is absent the dynamic path is unavailable; using the
+            # smaller 0.5 floor would regress underdispersion protection 5× vs Phase 3.
+            return torch.tensor(self.min_pi_width, device=device, dtype=dtype)
+
+        # y_insample: [B, T, N] or [B, T] — squeeze N if present
+        ys = y_insample.squeeze(-1) if y_insample.dim() == 3 else y_insample  # [B, T]
+        n_steps = min(4, ys.shape[1])
+        recent = ys[:, -n_steps:].float()                     # [B, n_steps]
+        vol = recent.std(dim=1, keepdim=True)                 # [B, 1]
+        # clamp NaN (e.g. n_steps=1 makes std=NaN)
+        vol = torch.nan_to_num(vol, nan=0.0)
+        dyn = (self.min_pi_width_multiplier * vol).clamp(min=self.min_pi_width_floor)
+        return dyn.unsqueeze(-1)                              # [B, 1, 1] for H×N broadcast
+
+    def _underdispersion_penalty(
+        self,
+        y_hat: torch.Tensor,
+        effective_lambda: torch.Tensor,
+        min_width,
+    ) -> torch.Tensor:
+        """Quadratic penalty when the predicted 95% PI is narrower than min_width.
+
+        Phase 4: ``effective_lambda`` is proportional to the current pinball loss
+        magnitude so the penalty stays scaled throughout training.  ``min_width``
+        is per-sample (``[B, 1, 1]``) derived from insample volatility.
 
         Parameters
         ----------
-        y_hat : ``[B, H, N, Q]`` — quantile predictions
+        y_hat           : ``[B, H, N, Q]`` — quantile predictions
+        effective_lambda: Scalar or tensor — adaptive penalty weight
+        min_width       : Scalar or ``[B, 1, 1]`` — dynamic minimum PI width
 
         Returns
         -------
@@ -256,8 +441,8 @@ class PINNWastewaterLoss(MQLoss):
         """
         if self._lower_idx is None or self._upper_idx is None:
             return torch.zeros(1, device=y_hat.device, dtype=y_hat.dtype).squeeze()
-        q_lower = y_hat[:, :, :, self._lower_idx]           # (B, H, N)
-        q_upper = y_hat[:, :, :, self._upper_idx]           # (B, H, N)
-        pi_width = q_upper - q_lower                        # (B, H, N); expect ≥ min_pi_width
-        shortfall = torch.clamp(self.min_pi_width - pi_width, min=0.0)
-        return self.underdispersion_lambda * (shortfall ** 2).mean()
+        q_lower = y_hat[:, :, :, self._lower_idx]             # (B, H, N)
+        q_upper = y_hat[:, :, :, self._upper_idx]             # (B, H, N)
+        pi_width = q_upper - q_lower                          # (B, H, N)
+        shortfall = torch.clamp(min_width - pi_width, min=0.0)
+        return effective_lambda * (shortfall ** 2).mean()

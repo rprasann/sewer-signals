@@ -13,9 +13,10 @@
 | **Project name** | Sewer Signals: Attention-Based Forecasting of COVID-19 Outbreaks from Wastewater |
 | **Repository** | `/Users/prasann/Dev/support_vectors/LLM/labs/wastewater` |
 | **Geography** | 9-county San Francisco Bay Area (CA FIPS 06001–06097) |
-| **Data source** | CDC NWSS (wastewater) × CDC archived county cases (Wednesday-anchored) |
+| **Data source** | CDC NWSS (wastewater) × CA county cases dataset (Wednesday-anchored) |
 | **Primary unit** | copies/g dry sludge (sludge track, all 9 counties) |
 | **Secondary unit** | copies/l wastewater (liquid track, Section 4.1 comparison only) |
+| **Validation set** | 3-county (San Francisco 06075, San Mateo 06081, Santa Clara 06085) |
 
 ---
 
@@ -55,7 +56,7 @@ case lags, and momentum features. These weights are directly interpretable as:
 ## 4. Data Pipeline Architecture
 
 ```
-Raw NWSS CSV  +  Raw CDC Cases CSV
+Raw NWSS CSV  +  Raw CA Cases CSV
         │
         ▼
 WastewaterProcessor (src/data_pipeline/processor.py)
@@ -90,27 +91,29 @@ Val and test splits call `transform()` with the stored scaler. Target lags
 | Role | Columns | Count |
 |---|---|---|
 | **Target (y)** | `log1p_new_cases` | 1 |
-| **Historical exog** | See table below | 15 |
+| **Historical exog** | See table below | 17 |
 | **Future-known** | Calendar Fourier + DOY | 11 |
 | **Static** | `log_population`, `county_fips_encoded`, `is_sludge` | 3 |
 
-### Historical Exogenous Features (HIST_COVARIATES — 15 total)
+### Historical Exogenous Features (HIST_COVARIATES — 17 total)
 
-| Group | Feature | Description |
-|---|---|---|
-| WW signal | `log1p_concentration` | WW at t |
-| WW lags | `log1p_concentration_lag1w/2w/3w` | WW at t-1, t-2, t-3 |
-| Case momentum | `log1p_new_cases_lag1w/2w/3w` | Cases at t-1, t-2, t-3 (VSN interpretability) |
-| Slope/phase | `growth_rate_1w` | Relative WW week-over-week change |
-| Slope/phase | `relative_decay_rate` | 7-day relative change on smoothed signal |
-| Slope/phase | `outlier_flag_int` | Z-score spike flag (QC) |
-| Derivative | `diff_concentration` | Absolute weekly velocity (Δ log1p_conc) |
-| Derivative | `log1p_concentration_2w_ma` | 2-week rolling mean (short baseline) |
-| Derivative | `log1p_concentration_4w_ma` | 4-week rolling mean (medium baseline) |
-| Derivative | `log1p_concentration_2w_std` | 2-week local volatility |
-| Derivative | `log1p_concentration_4w_std` | 4-week medium volatility |
+| Group | Feature | Phase Added | Description |
+|---|---|---|---|
+| WW signal | `log1p_concentration` | 1 | WW at t |
+| WW lags | `log1p_concentration_lag1w/2w/3w` | 1 | WW at t-1, t-2, t-3 |
+| Case momentum | `log1p_new_cases_lag1w/2w/3w` | 2 | Cases at t-1, t-2, t-3 (VSN interpretability) |
+| Slope/phase | `growth_rate_1w` | 1 | Relative WW week-over-week change |
+| Slope/phase | `relative_decay_rate` | 1 | 7-day relative change on smoothed signal |
+| Slope/phase | `outlier_flag_int` | 1 | Z-score spike flag (QC) |
+| Velocity | `vel_concentration` | 2 | Absolute weekly Δ log1p_conc |
+| Acceleration | `accel_concentration` | 3 | 2nd derivative: Δ velocity (inflection detector) |
+| Momentum context | `vel_concentration_lag1w` | 3 | Velocity 1 week ago (direction context) |
+| Rolling baseline | `log1p_concentration_2w_ma` | 2 | 2-week rolling mean (short baseline) |
+| Rolling baseline | `log1p_concentration_4w_ma` | 2 | 4-week rolling mean (medium baseline) |
+| Local volatility | `log1p_concentration_2w_std` | 2 | 2-week local volatility |
+| Local volatility | `log1p_concentration_4w_std` | 2 | 4-week medium volatility |
 
-### Key Hyperparameters (current)
+### Key Hyperparameters (current Phase 4 entry state)
 
 | Parameter | Value | Rationale |
 |---|---|---|
@@ -125,36 +128,41 @@ Val and test splits call `transform()` with the stored scaler. Target lags
 ### Loss Function: PINNWastewaterLoss (`src/models/loss_functions.py`)
 
 - **Base:** `MQLoss` (NeuralForecast pinball loss)
-- **Addition:** PINN growth-rate penalty (quadratic violation above `MAX_DAILY_GROWTH_RATE × 7`)
-- **Current lambda:** `GROWTH_RATE_LAMBDA = 0.0` (disabled for Phase 2 calibration)
-- **domain_map:** Identity reshape only — Softplus was **removed** because RobustScaled
-  target is legitimately negative; Softplus was collapsing all quantiles to zero
+- **PINN growth-rate penalty:** `GROWTH_RATE_LAMBDA = 0.0` (disabled since Phase 2)
+- **Underdispersion penalty:** Penalises 95% PI narrower than `MIN_PI_WIDTH` scaled units.
+  `UNDERDISPERSION_LAMBDA = 0.5` (Phase 3 static value; Phase 4 target: make dynamic)
+- **Minimum PI width:** `MIN_PI_WIDTH = 2.5` scaled units
+  (Phase 3 static value; Phase 4 target: replace with `multiplier × σ_t`)
+- **domain_map:** Identity reshape only — Softplus **removed** (Phase 2) because
+  RobustScaled target is legitimately negative; Softplus collapsed all quantiles to zero
+
+### Outbreak Detection: `OutbreakDetector` (`src/evaluation/metrics.py`)
+
+- **Current trigger:** `OUTBREAK_GROWTH_THRESHOLD = 0.25` — static 25% WoW growth
+  (Phase 3: lowered from 0.40 to improve AUC sensitivity)
+- **Phase 4 target:** Rolling z-score: `z = (x_t - μ_8w) / σ_8w > Z_THRESHOLD`
 
 ---
 
 ## 6. Temporal Map
 
 ### Data spine
-- **Frequency:** W-WED (Wednesday-anchored weekly, aligned to CDC cases dataset)
-- **Overlap window:** 2022-02-07 → 2023-05-10 (intersection of NWSS + cases datasets)
-- **First W-WED observation:** 2022-02-09
+- **Frequency:** W-WED (Wednesday-anchored weekly, aligned to CA cases dataset)
+- **Full window:** 2020-07-01 → 2023-12-19 (CA dataset cutoff)
+- **Effective start:** 2020-07-16 (earliest Santa Clara solid-track data)
 
-### Cross-Validation — 5 Expanding-Window Folds (step = 4 weeks)
+### Cross-Validation — Expanding-Window (~8 folds, step = 4 weeks)
 
-| Fold | Train window | Eval window | COVID wave in eval |
-|---|---|---|---|
-| 1 | 2022-02-09 → 2022-10-05 | 2022-10-12 → 2022-11-30 | BQ.1/BQ.1.1 fall surge **onset** |
-| 2 | 2022-02-09 → 2022-11-02 | 2022-11-09 → 2022-12-28 | BQ.1 **peak & decline** |
-| 3 | 2022-02-09 → 2022-11-30 | 2022-12-07 → 2023-01-25 | BQ.1 tail + XBB emergence |
-| 4 | 2022-02-09 → 2022-12-28 | 2023-01-04 → 2023-02-22 | XBB.1.5 **rise** |
-| 5 | 2022-02-09 → 2023-01-25 | 2023-02-01 → 2023-03-22 | XBB.1.5 **peak & initial decline** |
+| Stage | Window | Notes |
+|---|---|---|
+| First CV cutoff | 2022-10-05 | After all 9 counties active (last: Napa 2022-09-26) |
+| CV end / last cutoff | 2023-06-07 | ~35 W-WED periods beyond first cutoff |
+| **Holdout** | **2023-06-08 → 2023-12-19** | **28 W; post-XBB.1.5 + summer/fall 2023** |
 
-### Final Model & Holdout
-
-| Stage | Window | Length | COVID context |
-|---|---|---|---|
-| Final train | 2022-02-09 → 2023-01-25 | 51 W | BA.2, BA.4/5, BQ.1 all in training |
-| **Holdout** | **2023-02-01 → 2023-05-10** | **15 W** | **XBB.1.5 peak → decline → end** |
+### Why These Dates
+- Pre-2022-10-05 counties are zero-padded for early folds (`start_padding_enabled=True`)
+- 117 W-WED weeks of training before first CV fold >> INPUT_SIZE + H = 34 minimum
+- Holdout spans 3.5× H, giving reliable evaluation of the full 8-week forecast window
 
 ---
 
@@ -167,7 +175,7 @@ src/
     processor.py                   — 15-stage pipeline; WastewaterProcessor class
   models/
     tft_model.py                   — WastewaterTFT wrapper; HIST/FUTR/STATIC lists
-    loss_functions.py              — PINNWastewaterLoss (MQLoss + growth penalty)
+    loss_functions.py              — PINNWastewaterLoss (MQLoss + underdispersion + growth penalty)
   evaluation/
     metrics.py                     — WIS, coverage, SMAPE, OutbreakDetector,
                                      LeadTimeEvaluator, expanding_window_cv, evaluate()
@@ -184,10 +192,55 @@ main.py                            — CLI entry point (--fast, --skip-cv, --no-
 ## 8. Sludge vs. Liquid (Section 4.1)
 
 The pipeline supports two signal tracks:
-- **Sludge track** (`copies/g dry sludge`): primary track, all 9 Bay Area counties,
-  sludge-matrix concentration gives sharper decay-rate resolution
+- **Sludge track** (`copies/g dry sludge`): primary track, all 9 Bay Area counties
 - **Liquid track** (`copies/l wastewater`): secondary track, 6–7 counties,
-  used only for the Section 4.1 comparison and dashboard two-track chart
+  used only for Section 4.1 comparison and dashboard two-track chart
 
 The `is_sludge` static covariate (1/0) allows the global TFT to learn
 track-specific signal shapes within shared attention weights.
+
+---
+
+---
+
+## 9. Notebook Plotting Style Guide
+
+**Library:** matplotlib + seaborn (NOT Plotly — static images preferred over interactive)
+
+**Theme setup (every notebook):**
+```python
+sns.set_theme(style="whitegrid", font_scale=1.1)
+plt.rcParams.update({"figure.dpi": 120, "axes.titlesize": 13, "axes.labelsize": 11, "legend.fontsize": 9})
+```
+
+**Color palette — Bay Area (blue / cherry-red / orange):**
+- `C_WW = "steelblue"` — wastewater signal
+- `C_CASES = "crimson"` — clinical cases
+- `C_ACCENT = "darkorange"` — forecast / accent
+
+**Title format:**
+```python
+fig.suptitle("Specific Descriptive Title — What Is Featured\nSubtitle: key details (county filter, units, transform)", fontsize=13, fontweight="bold")
+```
+Examples: `"Merged WW Concentrations & Weekly Cases — 4 Illustrative Counties\nWW (left axis, steelblue log scale) leads Cases (right axis, crimson) by ~1–3 weeks"`
+
+**Axes:** always labeled with units — `ax.set_xlabel("Date (W-WED)", fontsize=10)` / `ax.set_ylabel("Copies/g (log)", fontsize=10)`
+
+**Legend:** `ax.legend(fontsize=9, loc="upper right")` — inside plot, top-right corner
+
+**Wave context bands:** `ax.axvspan(pd.Timestamp(ws), pd.Timestamp(we), alpha=0.07, color=wc, zorder=0)` using `ALL_WAVE_SPANS`
+
+**Dual-axis plots:** `ax.twinx()` — WW (`C_WW`) on left axis, cases (`C_CASES`) on right axis
+
+**Close every figure:** `plt.tight_layout()` then `plt.show()`
+
+---
+
+## 10. Phase History
+
+| Phase | Name | Key Outcome |
+|---|---|---|
+| 1 | Initial Baseline | Single-county TFT on Santa Clara; target = log1p_concentration |
+| 2 | Momentum Pivot | Target → log1p_new_cases; 7 quantiles; horizon_weight; 15 HIST_COVARIATES; identity scaler |
+| 3 | PoC Breakthrough | Underdispersion penalty; MIN_PI_WIDTH; accel_concentration; vel_concentration_lag1w; 3-county validation; data extended to 2023-12-19; 17 HIST_COVARIATES |
+| **4** | **Heuristics to Dynamics** | **Replace static λ, MIN_PI_WIDTH, OUTBREAK_GROWTH_THRESHOLD with dynamic computations** |

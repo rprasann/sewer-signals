@@ -1,0 +1,18 @@
+{
+  "run_id": "run_001_sc_phase3_baseline",
+  "label": "SC Phase3 Baseline",
+  "run_date": "2026-05-13",
+  "counties": [
+    "Santa Clara"
+  ],
+  "n_counties": 1,
+  "phase": "Phase 3",
+  "metrics": {
+    "mean_wis": 0.3783865010423443,
+    "coverage_50": 0.0,
+    "coverage_95": 0.375,
+    "smape": 0.9967768359067304,
+    "auc": 0.5
+  },
+  "notes": "Single-county Santa Clara run, Phase 3 static constants"
+}

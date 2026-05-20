@@ -59,6 +59,8 @@ from src.config import (
     TARGET_COL,
     TRAIN_END_DATE,
     VAL_END_DATE,
+    Z_OUTBREAK_THRESHOLD,
+    Z_SCORE_BASELINE_WEEKS,
 )
 
 # ---------------------------------------------------------------------------
@@ -229,35 +231,43 @@ def smape(
 # ---------------------------------------------------------------------------
 
 class OutbreakDetector:
-    """Flags onset weeks where the signal jumps ≥ 25 % above a rolling baseline.
+    """Flags onset weeks using either a Z-score or a relative growth threshold.
 
     Onset conditions (all must hold simultaneously):
-    1. Week-over-week growth ≥ ``growth_threshold`` relative to the
-       ``baseline_weeks``-week rolling mean of the *preceding* period.
+    1. Signal exceeds threshold — either:
+       - Z-score mode (Phase 4, default): z ≥ ``z_threshold`` relative to the
+         ``z_baseline_weeks``-week rolling mean/std of the *preceding* period.
+         Adapts to local signal variance so the same threshold is meaningful
+         across quiet inter-wave troughs and active surge periods.
+       - Growth mode (Phase 3 legacy): WoW growth ≥ ``growth_threshold``
+         relative to the ``baseline_weeks``-week rolling mean.
     2. Absolute signal ≥ ``min_absolute`` (prevents noise-driven false alarms
        during low-prevalence troughs where concentrations are near LOD).
-    3. Condition sustained for ``sustained_steps`` consecutive weeks (from
-       ``config.OUTBREAK_SUSTAINED_DAYS`` — interpreted here as weeks since
-       the processor resamples to weekly grain).
+    3. Condition sustained for ``sustained_steps`` consecutive weeks.
 
     Parameters
     ----------
-    growth_threshold : Fractional increase over baseline (default 0.25 = 25 %).
-    baseline_weeks   : Rolling window for the pre-onset baseline (default 4).
-    min_absolute     : Floor on the signal value; rows below this are never
-                       flagged regardless of the growth rate (default 0.1 in
-                       log1p units, ≈ 10.5 gc/L raw).
-    sustained_steps  : Consecutive above-threshold weeks required to confirm
-                       onset (default ``OUTBREAK_SUSTAINED_DAYS`` = 3).
+    z_threshold      : Phase 4 Z-score threshold (default Z_OUTBREAK_THRESHOLD = 2.0).
+                       Set to None to fall back to legacy growth_threshold mode.
+    z_baseline_weeks : Rolling window for Z-score baseline (default Z_SCORE_BASELINE_WEEKS).
+    growth_threshold : Phase 3 legacy fractional growth threshold (default 0.25).
+                       Used only when z_threshold is None.
+    baseline_weeks   : Rolling window for growth-mode baseline (default 4).
+    min_absolute     : Absolute signal floor below which no onset is flagged.
+    sustained_steps  : Consecutive above-threshold weeks to confirm onset.
     """
 
     def __init__(
         self,
+        z_threshold: float | None = Z_OUTBREAK_THRESHOLD,
+        z_baseline_weeks: int = Z_SCORE_BASELINE_WEEKS,
         growth_threshold: float = OUTBREAK_GROWTH_THRESHOLD,
         baseline_weeks: int = 4,
         min_absolute: float = 0.1,
         sustained_steps: int = OUTBREAK_SUSTAINED_DAYS,
     ) -> None:
+        self.z_threshold = z_threshold
+        self.z_baseline_weeks = z_baseline_weeks
         self.growth_threshold = growth_threshold
         self.baseline_weeks = baseline_weeks
         self.min_absolute = min_absolute
@@ -271,23 +281,27 @@ class OutbreakDetector:
 
         Parameters
         ----------
-        series : Weekly wastewater signal (e.g. ``log1p_concentration``),
-                 sorted chronologically, with a DatetimeIndex or matching index.
+        series : Weekly signal (e.g. ``log1p_new_cases``), sorted chronologically.
         """
         series = series.copy().astype(float)
 
-        # 4-week rolling mean of weeks *before* current week (shift avoids leakage)
-        baseline = (
-            series.shift(1)
-            .rolling(window=self.baseline_weeks, min_periods=2)
-            .mean()
-        )
-        growth = (series - baseline) / (baseline.abs() + 1e-8)
+        if self.z_threshold is not None:
+            # Phase 4: Z-score relative to rolling baseline (shift avoids leakage)
+            shifted = series.shift(1)
+            roll_mean = shifted.rolling(window=self.z_baseline_weeks, min_periods=4).mean()
+            roll_std  = shifted.rolling(window=self.z_baseline_weeks, min_periods=4).std().fillna(0.0)
+            z_score = (series - roll_mean) / (roll_std + 1e-8)
+            per_step_flag = (z_score >= self.z_threshold) & (series >= self.min_absolute)
+        else:
+            # Phase 3 legacy: relative growth over short baseline
+            baseline = (
+                series.shift(1)
+                .rolling(window=self.baseline_weeks, min_periods=2)
+                .mean()
+            )
+            growth = (series - baseline) / (baseline.abs() + 1e-8)
+            per_step_flag = (growth >= self.growth_threshold) & (series >= self.min_absolute)
 
-        # Both conditions: growth rate AND absolute floor
-        per_step_flag = (growth >= self.growth_threshold) & (series >= self.min_absolute)
-
-        # Require the flag to hold for `sustained_steps` consecutive steps
         confirmed = (
             per_step_flag
             .rolling(window=self.sustained_steps, min_periods=self.sustained_steps)
@@ -468,26 +482,31 @@ class LeadTimeResult:
 class LeadTimeEvaluator:
     """Binary outbreak classifier and lead-time analyser.
 
-    **Score**: maximum week-over-week growth rate in the predicted median
-    trajectory across the forecast horizon.  A high score means the model
-    is projecting a rapid acceleration — a pre-outbreak signal.
+    **Score**: Phase 4 default uses the maximum Z-score of the predicted median
+    relative to an 8-week rolling baseline drawn from the actual history
+    immediately before the forecast origin.  Adapts to local signal variance,
+    producing a more calibrated continuous score for AUC computation than raw
+    growth rates.
 
-    **Decision threshold**: ``growth_threshold`` (default 0.25).  If the
-    maximum predicted growth rate ≥ threshold the model is considered to
-    have issued an alert for that window.
+    **Decision threshold**: ``z_alert_threshold`` (default Z_OUTBREAK_THRESHOLD = 2.0
+    when Z-score scoring is active, else ``growth_threshold`` = 0.25).
 
     **Label**: 1 if at least one confirmed onset (from ``OutbreakDetector``)
     falls within the forecast horizon window, else 0.
 
-    **Lead time**: for each TP event, the difference
+    **Lead time**: for each TP event,
     ``actual_onset_date − forecast_origin_date`` in calendar days.
     Positive = model alerted before the confirmed clinical onset.
 
     Parameters
     ----------
-    detector          : Pre-configured OutbreakDetector for onset labelling.
-    growth_threshold  : Decision boundary on the predicted slope score.
-    horizon_weeks     : Forecast horizon length (weeks).
+    detector              : Pre-configured OutbreakDetector for onset labelling.
+    growth_threshold      : Phase 3 legacy binary alert threshold.
+    horizon_weeks         : Forecast horizon length (weeks).
+    z_score_baseline_weeks: Weeks of actual history before forecast origin used to
+                            compute the Z-score baseline.  Set to 0 to fall back to
+                            growth-rate scoring (Phase 3 behaviour).
+    z_alert_threshold     : Decision threshold when Z-score scoring is active.
     """
 
     def __init__(
@@ -495,10 +514,14 @@ class LeadTimeEvaluator:
         detector: Optional[OutbreakDetector] = None,
         growth_threshold: float = OUTBREAK_GROWTH_THRESHOLD,
         horizon_weeks: int = 2,
+        z_score_baseline_weeks: int = 0,
+        z_alert_threshold: float = Z_OUTBREAK_THRESHOLD,
     ) -> None:
         self.detector = detector or OutbreakDetector()
         self.growth_threshold = growth_threshold
         self.horizon_weeks = horizon_weeks
+        self.z_score_baseline_weeks = z_score_baseline_weeks
+        self.z_alert_threshold = z_alert_threshold
 
     def evaluate(
         self,
@@ -534,6 +557,9 @@ class LeadTimeEvaluator:
         lead_times: list[float] = []
         tp = fp = tn = fn = 0
 
+        # Pre-index actual history for fast per-county baseline lookup
+        actual_indexed = actual_df.copy()
+
         for uid, fcast_grp in forecast_df.groupby(id_col):
             fcast_grp = fcast_grp.sort_values(date_col)
 
@@ -554,20 +580,49 @@ class LeadTimeEvaluator:
             ]
             label = int(len(onset_in_window) > 0)
 
-            # Score: max predicted week-over-week growth in median trajectory
+            # Score: Phase 4 growth-rate Z-score — z-score of the forecast's WoW
+            # growth rates relative to the distribution of historical growth rates.
+            # A flat forecast scores ~0 regardless of its level; only accelerating
+            # trajectories score high.  Falls back to raw max growth rate when the
+            # historical baseline is too short for a reliable std estimate.
             median = fcast_grp[q_cols.q50].to_numpy(dtype=float)
-            if len(median) > 1:
-                denom = np.abs(median[:-1]) + 1e-8
-                growth_rates = (median[1:] - median[:-1]) / denom
-                score = float(growth_rates.max())
-            else:
-                score = 0.0
+            use_z = self.z_score_baseline_weeks > 0 and len(median) > 1
+
+            if use_z:
+                actual_county_all = actual_indexed[
+                    actual_indexed[actual_id_col] == uid
+                ].sort_values(actual_date_col)
+                history = actual_county_all[
+                    actual_county_all[actual_date_col] < horizon_start
+                ][actual_signal_col].to_numpy(dtype=float)
+                if len(history) >= 4:
+                    recent = history[-self.z_score_baseline_weeks:]
+                    hist_growth = np.diff(recent) / (np.abs(recent[:-1]) + 1e-8)
+                    bl_mean = float(np.mean(hist_growth))
+                    bl_std  = float(np.std(hist_growth)) + 1e-8
+                    fcast_growth = (median[1:] - median[:-1]) / (np.abs(median[:-1]) + 1e-8)
+                    z_scores = (fcast_growth - bl_mean) / bl_std
+                    score = float(z_scores.max())
+                else:
+                    use_z = False
+
+            if not use_z:
+                if len(median) > 1:
+                    denom = np.abs(median[:-1]) + 1e-8
+                    score = float(((median[1:] - median[:-1]) / denom).max())
+                else:
+                    score = 0.0
 
             labels.append(label)
             scores.append(score)
 
-            # Binary decision
-            alert = score >= self.growth_threshold
+            # Binary decision uses Z-score threshold or growth threshold accordingly
+            alert_threshold = (
+                self.z_alert_threshold
+                if self.z_score_baseline_weeks > 0
+                else self.growth_threshold
+            )
+            alert = score >= alert_threshold
 
             if label == 1 and alert:
                 tp += 1
@@ -621,7 +676,7 @@ class LeadTimeEvaluator:
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Return (fpr, tpr, thresholds) for a full ROC curve.
 
-        Useful for visualisation in the dashboard.
+        Uses the same Z-score scoring logic as ``evaluate()`` for consistency.
         """
         labels: list[int] = []
         scores: list[float] = []
@@ -642,6 +697,18 @@ class LeadTimeEvaluator:
             labels.append(int(len(onset_in_window) > 0))
 
             median = fcast_grp[q_cols.q50].to_numpy(dtype=float)
+            use_z = self.z_score_baseline_weeks > 0 and len(median) > 1
+            if use_z:
+                hist_vals = actual_df[actual_df[COUNTY_COL] == uid].copy()
+                hist_vals = hist_vals[hist_vals[NWSS_DATE_COL] < start][TARGET_COL].to_numpy(dtype=float)
+                if len(hist_vals) >= 4:
+                    recent = hist_vals[-self.z_score_baseline_weeks:]
+                    hist_growth = np.diff(recent) / (np.abs(recent[:-1]) + 1e-8)
+                    bl_mean = float(np.mean(hist_growth))
+                    bl_std  = float(np.std(hist_growth)) + 1e-8
+                    fcast_growth = (median[1:] - median[:-1]) / (np.abs(median[:-1]) + 1e-8)
+                    scores.append(float(((fcast_growth - bl_mean) / bl_std).max()))
+                    continue
             if len(median) > 1:
                 denom = np.abs(median[:-1]) + 1e-8
                 scores.append(float(((median[1:] - median[:-1]) / denom).max()))
@@ -912,22 +979,23 @@ def evaluate(
         for uid in merged["unique_id"].unique()
     }
 
-    # --- Outbreak / lead-time metrics ---
-    detector   = OutbreakDetector(min_absolute=min_absolute)
-    evaluator  = LeadTimeEvaluator(detector=detector)
+    # --- Outbreak / lead-time metrics (Phase 4: Z-score detector + Z-score AUC) ---
+    # Explicitly opt into Z-score detection in the all-in-one wrapper.
+    detector   = OutbreakDetector(min_absolute=min_absolute, z_threshold=Z_OUTBREAK_THRESHOLD)
+    evaluator  = LeadTimeEvaluator(
+        detector=detector,
+        z_score_baseline_weeks=Z_SCORE_BASELINE_WEEKS,  # opt-in to Phase 4 Z-score scoring
+    )
     lt_result  = evaluator.evaluate(actual_df, forecast_df, q_cols)
 
     labelled = detector.detect_df(actual_df)
     n_actual = int(labelled["onset"].sum())
 
-    n_alerts_per_window = []
-    for _, fgrp in forecast_df.groupby("unique_id"):
-        median = fgrp[q_cols.q50].to_numpy(dtype=float)
-        if len(median) > 1:
-            denom = np.abs(median[:-1]) + 1e-8
-            max_growth = float(((median[1:] - median[:-1]) / denom).max())
-            n_alerts_per_window.append(int(max_growth >= OUTBREAK_GROWTH_THRESHOLD))
-    n_alerts = sum(n_alerts_per_window)
+    # Alert count: windows where the model predicted an onset (TP + FP from Z-score evaluator).
+    # Previously computed from a stale OUTBREAK_GROWTH_THRESHOLD loop that was inconsistent
+    # with the Z-score detector used everywhere else.  Now derived directly from lt_result
+    # so the reported n_predicted_alerts always reflects the same scoring logic as AUC/Sensitivity.
+    n_alerts = lt_result.tp + lt_result.fp
 
     # --- Recovery / fall-phase metrics ---
     recovery_analyzer = OutbreakRecovery(min_peak_value=min_absolute)

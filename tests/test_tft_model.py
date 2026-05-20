@@ -30,6 +30,17 @@ from src.models.tft_model import (
     WastewaterTFT,
     build_future_df,
 )
+
+# Columns the fixture computes manually; any HIST_COVARIATES column not listed
+# here is added automatically with synthetic random data at fixture-build time.
+_FIXTURE_MANUAL_COLS = {
+    "log1p_concentration", "log1p_concentration_lag1w", "log1p_concentration_lag2w",
+    "log1p_concentration_lag3w", "log1p_new_cases_lag1w", "log1p_new_cases_lag2w",
+    "log1p_new_cases_lag3w", "growth_rate_1w", "relative_decay_rate",
+    "vel_concentration", "accel_concentration", "vel_concentration_lag1w",
+    "log1p_concentration_2w_ma", "log1p_concentration_4w_ma",
+    "log1p_concentration_2w_std", "log1p_concentration_4w_std", "outlier_flag",
+}
 from src.utils.helpers import console
 
 
@@ -62,7 +73,9 @@ def processed_df():
                     "log1p_new_cases_lag3w": float(rng.normal(1.5, 0.3)),
                     "growth_rate_1w": float(rng.normal(0, 0.2)),
                     "relative_decay_rate": float(rng.uniform(-1.0, 1.0)),
-                    "diff_concentration": float(rng.normal(0, 0.1)),
+                    "vel_concentration": float(rng.normal(0, 0.1)),
+                    "accel_concentration": float(rng.normal(0, 0.05)),
+                    "vel_concentration_lag1w": float(rng.normal(0, 0.1)),
                     "log1p_concentration_2w_ma": float(rng.normal(1.5, 0.2)),
                     "log1p_concentration_4w_ma": float(rng.normal(1.5, 0.2)),
                     "log1p_concentration_2w_std": float(rng.uniform(0, 0.5)),
@@ -82,7 +95,13 @@ def processed_df():
                     "week_of_year": int(ds.isocalendar()[1]),
                 }
             )
-    return pd.DataFrame(rows)
+    df = pd.DataFrame(rows)
+    # Auto-add any HIST_COVARIATES not manually included so the fixture stays
+    # valid when new features are added to the covariate list.
+    for col in HIST_COVARIATES:
+        if col not in df.columns:
+            df[col] = rng.standard_normal(len(df))
+    return df
 
 
 # ===========================================================================
@@ -237,18 +256,29 @@ class TestToNfFormat:
         assert len(static_df) == n_counties
 
     def test_static_df_has_log_population(self, nf_pair):
+        # log_population is z-scored across counties; values are finite (can be negative).
         _, static_df = nf_pair
         assert "log_population" in static_df.columns
-        assert (static_df["log_population"] >= 0).all()
+        assert static_df["log_population"].notna().all()
+        assert np.isfinite(static_df["log_population"].to_numpy()).all()
 
-    def test_log_population_is_log1p_of_median_pop(self, nf_pair, processed_df):
+    def test_log_population_is_zscore_of_log1p_median_pop(self, nf_pair, processed_df):
+        # log_population = (log1p(median_pop) - mean) / std  across all counties (ddof=0).
         ts_df, static_df = nf_pair
+        raw_log_pops = np.array([
+            float(np.log1p(
+                processed_df.loc[processed_df[COUNTY_COL] == fips, "population_served"].median()
+            ))
+            for fips in sorted(static_df["unique_id"].unique())
+        ])
+        pop_mean = float(raw_log_pops.mean())
+        pop_std  = float(raw_log_pops.std(ddof=0))
         for fips in processed_df[COUNTY_COL].unique():
             median_pop = processed_df.loc[processed_df[COUNTY_COL] == fips, "population_served"].median()
-            expected_log_pop = float(np.log1p(median_pop))
-            row = static_df[static_df["unique_id"] == fips]
-            actual = float(row["log_population"].iloc[0])
-            assert actual == pytest.approx(expected_log_pop, rel=1e-5)
+            raw_log = float(np.log1p(median_pop))
+            expected = (raw_log - pop_mean) / pop_std if pop_std > 1e-6 else 0.0
+            actual   = float(static_df.loc[static_df["unique_id"] == fips, "log_population"].iloc[0])
+            assert actual == pytest.approx(expected, abs=1e-5)
 
     def test_static_df_has_is_sludge(self, nf_pair):
         _, static_df = nf_pair

@@ -1,0 +1,26 @@
+{
+  "run_id": "run_002_9-county_bay_area_phase4",
+  "label": "9-County Bay Area Phase4",
+  "run_date": "2026-05-13",
+  "counties": [
+    "Alameda",
+    "Contra Costa",
+    "Marin",
+    "Napa",
+    "San Francisco",
+    "San Mateo",
+    "Santa Clara",
+    "Solano",
+    "Sonoma"
+  ],
+  "n_counties": 9,
+  "phase": "Phase 4",
+  "metrics": {
+    "mean_wis": 0.5684314220289794,
+    "coverage_50": 0.027777777777777776,
+    "coverage_95": 0.06944444444444445,
+    "smape": 0.576055506662553,
+    "auc": 0.5
+  },
+  "notes": "9-county run, Phase 4 dynamic losses"
+}

@@ -146,6 +146,39 @@ class WastewaterProcessor:
             raise RuntimeError("Scaler not fitted. Call run() on training data first.")
         return self.run(raw, cases_df, fit_scaler=False)
 
+    def save_scalers(self, path) -> None:
+        """Persist per-county scalers and scale_cols list to disk via joblib.
+
+        Call immediately after ``run()`` on training data.  Any downstream
+        session (dashboard reload, notebook, standalone inference) can then
+        call ``load_scalers()`` to reconstruct the exact inversion parameters
+        without re-running the full pipeline.
+        """
+        import joblib
+        from pathlib import Path as _Path
+        joblib.dump(
+            {"scalers": self._scalers, "scale_cols": self._scale_cols},
+            _Path(path),
+        )
+        logger.info("Scalers saved to {} ({} counties).", path, len(self._scalers))
+
+    def load_scalers(self, path) -> None:
+        """Restore per-county scalers from a previously saved file.
+
+        Populates ``self._scalers``, ``self._scale_cols``, and the backward-
+        compat ``self._scaler`` alias so that ``_invert_scaling_to_log1p``
+        works without needing to re-run the pipeline.
+        """
+        import joblib
+        from pathlib import Path as _Path
+        payload = joblib.load(_Path(path))
+        self._scalers = payload["scalers"]
+        self._scale_cols = payload["scale_cols"]
+        self._scaler = next(iter(self._scalers.values())) if self._scalers else None
+        logger.info(
+            "Scalers loaded from {} ({} counties).", path, len(self._scalers)
+        )
+
     def split(
         self, df: pd.DataFrame
     ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
@@ -605,18 +638,18 @@ class WastewaterProcessor:
         ).clip(-5.0, 5.0)
 
         # Derivative expansion — velocity, acceleration, and rolling momentum statistics
-        df["diff_concentration"] = ww_grp.diff(1)                 # 1st derivative (velocity)
+        df["vel_concentration"] = ww_grp.diff(1)                   # 1st derivative (velocity)
 
         # Acceleration = second difference; captures inflection points of surges.
         # Positive accel + positive velocity → acceleration phase (high alert).
         # Negative accel + positive velocity → deceleration / approaching peak.
-        df["ww_accel"] = df.groupby(COUNTY_COL)["diff_concentration"].transform(
+        df["accel_concentration"] = df.groupby(COUNTY_COL)["vel_concentration"].transform(
             lambda s: s.diff(1)
         )
 
         # Lagged velocity: where was momentum 1 week ago?  Gives the model
         # explicit "momentum direction" without recomputing from raw lags.
-        df["diff_concentration_lag1w"] = df.groupby(COUNTY_COL)["diff_concentration"].shift(1)
+        df["vel_concentration_lag1w"] = df.groupby(COUNTY_COL)["vel_concentration"].shift(1)
 
         df["log1p_concentration_2w_ma"]  = ww_grp.transform(
             lambda s: s.rolling(2, min_periods=1).mean()
@@ -680,9 +713,9 @@ class WastewaterProcessor:
             f"{TARGET_COL}_lag3w",            # cases at t-3
             "growth_rate_1w",                 # WW relative week-over-week growth (raw-conc basis)
             "relative_decay_rate",            # WW 7-day relative change
-            "diff_concentration",             # absolute weekly Δ log1p_conc (velocity)
-            "ww_accel",                       # second Δ log1p_conc (acceleration)
-            "diff_concentration_lag1w",       # velocity 1 week ago (momentum direction)
+            "vel_concentration",               # absolute weekly Δ log1p_conc (velocity)
+            "accel_concentration",            # second Δ log1p_conc (acceleration)
+            "vel_concentration_lag1w",        # velocity 1 week ago (momentum direction)
             "log1p_concentration_2w_ma",      # 2-week rolling mean
             "log1p_concentration_4w_ma",      # 4-week rolling mean
             "log1p_concentration_2w_std",     # 2-week rolling std (local volatility)

@@ -71,6 +71,21 @@ BAY_AREA_FIPS: dict[str, str] = {
 # Reverse map for lookup
 FIPS_TO_COUNTY: dict[str, str] = {v: k for k, v in BAY_AREA_FIPS.items()}
 
+# 2020 US Census total county population — used as fallback when the WW dataset
+# has no population_served column (CA WW CSV omits this field).  Absolute values
+# are approximate; the VSN only needs the relative ordering across counties.
+BAY_AREA_POPULATION: dict[str, int] = {
+    "06001": 1_682_353,   # Alameda
+    "06013": 1_165_927,   # Contra Costa
+    "06041":   258_826,   # Marin
+    "06055":   136_484,   # Napa
+    "06075":   873_965,   # San Francisco
+    "06081":   764_442,   # San Mateo
+    "06085": 1_936_259,   # Santa Clara
+    "06095":   447_643,   # Solano
+    "06097":   488_863,   # Sonoma
+}
+
 # Single-county validation target (largest, best-instrumented county)
 SANTA_CLARA_FIPS: str = "06085"
 
@@ -145,14 +160,12 @@ TFT_CONFIG: dict = {
     "n_head":              4,           # multi-head self-attention heads
     "attn_dropout":        0.1,
     "dropout":             0.1,
-    "ff_hidden_size":      256,         # feed-forward sublayer width (2× hidden_size)
 
-    # Encoder / decoder depth
-    "encoder_layers":      2,           # number of LSTM encoder layers
-    "decoder_layers":      2,
+    # LSTM depth — n_rnn_layers applies to both encoder and decoder in NF's TFT
+    "encoder_layers":      2,
 
-    # Variable selection networks
-    "n_quantiles":         7,           # mirrors QUANTILE_LEVELS length
+    # Quantile levels — NOT passed to TFT; read as QUANTILE_LEVELS below and
+    # passed to PINNWastewaterLoss.  Listed here as the single source of truth.
     "quantile_levels":     [0.025, 0.10, 0.25, 0.50, 0.75, 0.90, 0.975],
 
     # Training
@@ -216,8 +229,26 @@ PAST_COVARIATES: list[str] = [
 # suppresses the rapid growth trajectories in Folds 1–2 (BQ.1 onset) and the
 # holdout (XBB.1.5 peak).  With 0% PI coverage the priority is getting quantile
 # spread right; the biological prior can be restored once coverage is healthy.
-GROWTH_RATE_LAMBDA = 0.0            # PINN growth-rate penalty disabled (Phase 2 calibration)
-MAX_DAILY_GROWTH_RATE = 0.35        # ln(2)/2 ≈ 0.347; weekly threshold = ×7 ≈ 2.45
+GROWTH_RATE_LAMBDA = 0.0            # Disabled — isolate underdispersion + monotonicity dynamics
+MAX_DAILY_GROWTH_RATE = 0.35        # ln(2)/2 ≈ 0.347; kept for GrowthRatePenalty standalone class
+
+# Phase 4 — volatility-adjusted weekly step-change cap for the scaled forecast median.
+# Dynamic cap: dyn_cap_t = STEP_CHANGE_MULTIPLIER × σ(y_insample[-4:])
+#              clamped to min=MAX_WEEKLY_STEP_CHANGE (static floor / fallback).
+#
+# The old relative-rate formula (Δy / |y|) is pathological in RobustScaled space:
+#   • near zero (|y| ≈ 0.1) any small Δy looks like a huge rate → penalty fires too early
+#   • at high values (|y| ≈ 2.0) the same Δy looks small → penalty misses hallucinated peaks
+#
+# The dynamic cap adapts to local signal volatility:
+#   • calm inter-wave (σ ≈ 0.3): cap = max(3.0×0.3, 1.5) = 1.5 → tight, prevents hallucination
+#   • surge onset     (σ ≈ 0.8): cap = max(3.0×0.8, 1.5) = 2.4 → relaxes, allows legitimate tracking
+#   • peak            (σ ≈ 1.5): cap = max(3.0×1.5, 1.5) = 4.5 → wide open at peak volatility
+#
+# Mirrors _dynamic_min_width: STEP_CHANGE_MULTIPLIER is analogous to MIN_PI_WIDTH_MULTIPLIER;
+# MAX_WEEKLY_STEP_CHANGE is the floor (analogous to MIN_PI_WIDTH_FLOOR / MIN_PI_WIDTH fallback).
+STEP_CHANGE_MULTIPLIER = 3.0        # multiplier on per-sample insample std (dimensionless)
+MAX_WEEKLY_STEP_CHANGE = 1.5        # static floor / fallback when y_insample unavailable
 
 # Underdispersion penalty — penalises the model when the predicted 95% PI is
 # narrower than MIN_PI_WIDTH scaled units.  After RobustScaling the IQR ≈ 1.0,
@@ -225,8 +256,20 @@ MAX_DAILY_GROWTH_RATE = 0.35        # ln(2)/2 ≈ 0.347; weekly threshold = ×7 
 # units (±1.96σ, σ≈IQR/1.35).  Phase 3 values: lambda=0.5 (5× Phase 2) and
 # MIN_PI_WIDTH=2.5 (~86% of theoretical width) — strong enough to overcome the
 # pinball gradient that naturally collapses PIs, without dominating training.
-UNDERDISPERSION_LAMBDA = 0.5        # weight of underdispersion penalty (Phase 3: 0.1→0.5)
-MIN_PI_WIDTH = 2.5                  # minimum 95% PI width in scaled units (Phase 3: 1.5→2.5)
+UNDERDISPERSION_LAMBDA = 0.5        # Phase 3 static value (superseded by Phase 4 K-ratio)
+MIN_PI_WIDTH = 2.5                  # Phase 3 static floor (superseded by Phase 4 multiplier)
+
+# Phase 4 — adaptive underdispersion penalty
+# effective_lambda = UNDERDISPERSION_K × mean_pinball_loss (dimensionless ratio).
+# Keeps the penalty proportional to the base loss magnitude throughout training;
+# prevents dominance as Pinball loss falls while underdispersion lambda stays fixed.
+UNDERDISPERSION_K = 0.5             # target: underdispersion penalty ≈ 50% of pinball loss
+
+# Phase 4 — volatility-adjusted minimum PI width
+# min_width_t = MIN_PI_WIDTH_MULTIPLIER × σ(y_insample[-4:])
+# Wider during surge onsets (high σ), narrower during calm baselines (low σ).
+MIN_PI_WIDTH_MULTIPLIER = 2.0       # multiplier on per-sample insample std
+MIN_PI_WIDTH_FLOOR = 0.5            # absolute minimum width floor (scaled units)
 
 QUANTILE_LEVELS = TFT_CONFIG["quantile_levels"]
 
@@ -245,7 +288,16 @@ WIS_MEDIAN_QUANTILE = 0.50
 # Outbreak detection threshold: signal > OUTBREAK_PERCENTILE of trailing baseline
 OUTBREAK_PERCENTILE = 90           # percentile of 90-day rolling baseline
 OUTBREAK_SUSTAINED_DAYS = 3        # must stay above threshold for N days
-OUTBREAK_GROWTH_THRESHOLD = 0.25   # 25% WoW increase flags onset (Phase 3: lowered from 0.40 to lift sensitivity for AUC)
+OUTBREAK_GROWTH_THRESHOLD = 0.25   # Phase 3 static threshold (superseded by Phase 4 z-score)
+
+# Phase 4 — Z-score outbreak detection (replaces OUTBREAK_GROWTH_THRESHOLD)
+# Alert when signal z-score > Z_OUTBREAK_THRESHOLD relative to the preceding
+# Z_SCORE_BASELINE_WEEKS rolling baseline (mean + std).  Z-score adapts to the
+# signal's local variance, so the same threshold is meaningful during both
+# quiet inter-wave periods (when 25% WoW is noise) and active waves.
+Z_OUTBREAK_THRESHOLD = 2.0         # standard deviations above rolling baseline
+Z_SCORE_BASELINE_WEEKS = 8         # rolling window (weeks) for baseline mean/std
+
 LEAD_TIME_WINDOW_MIN = 7           # days before clinical confirmation
 LEAD_TIME_WINDOW_MAX = 21
 
