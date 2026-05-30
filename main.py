@@ -55,8 +55,18 @@ from __future__ import annotations
 
 import argparse
 import json
+import warnings
 from datetime import datetime
 from pathlib import Path
+
+# Suppress PyTorch Lightning internal deprecation warning for isinstance(treespec, LeafSpec).
+# This comes from PL's _pytree.py and is a PL internals issue, not actionable from user code.
+warnings.filterwarnings(
+    "ignore",
+    message=".*isinstance.*LeafSpec.*",
+    category=DeprecationWarning,
+    module="pytorch_lightning.*",
+)
 
 import numpy as np
 import pandas as pd
@@ -87,9 +97,11 @@ from src.config import (
 from src.data_pipeline.processor import CAWastewaterProcessor
 from src.evaluation.metrics import (
     EvalResult,
+    OutbreakWindowResult,
     QuantileColumns,
     evaluate,
     expanding_window_cv,
+    run_outbreak_validation,
 )
 from src.models.tft_model import WastewaterTFT
 from src.utils.helpers import (
@@ -157,6 +169,32 @@ def _parse_args() -> argparse.Namespace:
             "Pass '3county' for the spatial-temporal validation set "
             "(SF, San Mateo, Santa Clara), or a comma-separated list of "
             "5-digit FIPS codes (e.g. '06075,06081,06085')."
+        ),
+    )
+    p.add_argument(
+        "--outbreak-validation", action="store_true",
+        help=(
+            "After the main pipeline, run targeted validation against the "
+            "historical outbreak windows defined in OUTBREAK_VALIDATION_WINDOWS. "
+            "Trains one fast model (500 steps) per window. Adds ~10-20 min."
+        ),
+    )
+    p.add_argument(
+        "--rolling-holdout", action="store_true",
+        help=(
+            "After the main evaluation, run a rolling forecast across the full "
+            "28-week holdout (VAL_END_DATE → DATA_END_DATE) in 4-week steps. "
+            "Trains one model per step (~5 models). Covers the complete holdout "
+            "rather than just the first 8 weeks. Adds ~15-30 min."
+        ),
+    )
+    p.add_argument(
+        "--max-steps", type=int, default=None,
+        help=(
+            "Override TFT_CONFIG max_steps for this run. "
+            "Useful for fast visualization reruns (e.g. 500 steps ≈ 35 min for "
+            "7-fold rolling holdout vs 2.5 h at 2000 steps). "
+            "Defaults to TFT_CONFIG['max_steps'] (2000) or 200 with --fast."
         ),
     )
     return p.parse_args()
@@ -670,6 +708,8 @@ def main() -> None:
         )
         dash_forecast = pd.read_parquet(PROCESSED_DIR / "forecast.parquet")
         dash_q_cols   = QuantileColumns.auto_detect(dash_forecast)
+        _rolling_path = PROCESSED_DIR / "rolling_forecast.parquet"
+        _dash_rolling = pd.read_parquet(_rolling_path) if _rolling_path.exists() else pd.DataFrame()
         logger.info(
             "Dashboard at http://localhost:{} — {} county-weeks, {} forecast rows",
             args.port, len(dash_processed), len(dash_forecast),
@@ -679,12 +719,13 @@ def main() -> None:
             forecast_df=dash_forecast,
             q_cols=dash_q_cols,
             runs_dir=RUNS_DIR,
+            rolling_forecast_df=_dash_rolling,
         )
         app.run(host=DASH_HOST, port=args.port, debug=DASH_DEBUG)
         return
 
     skip_cv   = args.skip_cv or args.fast
-    max_steps = 200 if args.fast else cfg.TFT_CONFIG["max_steps"]
+    max_steps = 200 if args.fast else (args.max_steps or cfg.TFT_CONFIG["max_steps"])
     cv_steps  = min(max_steps, 500)
 
     console.rule("[bold white] Sewer Signals — Bay Area Wastewater Surveillance [/bold white]")
@@ -696,6 +737,14 @@ def main() -> None:
     # ── 1. Load raw data ──────────────────────────────────────────────────────
     raw_ww    = _load_ca_ww_csv(CA_WW_CSV)
     raw_cases = _load_ca_cases_csv(CA_CASES_CSV)
+
+    # Always-on exclusion: Napa + Solano have insufficient WW history for a
+    # meaningful RobustScaler fit and are absent from the production dashboard.
+    if cfg.EXCLUDE_FIPS:
+        _excl_names = [cfg.FIPS_TO_COUNTY[f] for f in cfg.EXCLUDE_FIPS if f in cfg.FIPS_TO_COUNTY]
+        raw_ww    = raw_ww[~raw_ww["county_name"].isin(_excl_names)].copy()
+        raw_cases = raw_cases[~raw_cases[cfg.COUNTY_COL].isin(cfg.EXCLUDE_FIPS)].copy()
+        logger.info("Excluded {} (insufficient WW history): {}", cfg.EXCLUDE_FIPS, _excl_names)
 
     # Optional county filter (--counties 3county | --counties 06075,06081,06085)
     if args.counties:
@@ -757,6 +806,63 @@ def main() -> None:
             forecast_df["ds"].max().date() if not forecast_df.empty else "?",
         )
 
+    # ── 5b. Rolling holdout evaluation (optional) ────────────────────────────
+    # Extends evaluation across the full 28-week holdout by stepping a 4-week
+    # window from VAL_END_DATE → DATA_END_DATE.  Each step retrains the model
+    # on all data up to that cutoff, producing ~5 overlapping 8-week forecasts.
+    # Results are appended to cv_df so the dashboard CV chart shows all folds.
+    if args.rolling_holdout:
+        console.rule("[bold cyan] Rolling Holdout Evaluation [/bold cyan]")
+        logger.info(
+            "Rolling holdout: {} → {} in 4-week steps.",
+            cfg.VAL_END_DATE, cfg.DATA_END_DATE,
+        )
+        _rolling_trainer_kwargs = {
+            "enable_progress_bar":  False,
+            "enable_model_summary": False,
+            "early_stop_patience_steps": -1,
+        }
+        _rolling_forecast_frames: list[pd.DataFrame] = []
+        rolling_df = expanding_window_cv(
+            processed_df=sludge_all,
+            model_factory=lambda: WastewaterTFT(
+                max_steps=max_steps, trainer_kwargs=_rolling_trainer_kwargs
+            ),
+            initial_train_end=cfg.VAL_END_DATE,
+            eval_end=cfg.DATA_END_DATE,
+            step_weeks=4,
+            forecast_collector=_rolling_forecast_frames,
+        )
+        if not rolling_df.empty:
+            console.rule("[bold]Rolling Holdout — Full 28-Week Coverage[/bold]")
+            print_cv_summary(rolling_df)
+            # Merge into cv_df so the dashboard CV chart shows holdout folds too
+            rolling_df["split"] = "holdout"
+            if not cv_df.empty:
+                cv_df["split"] = "cv"
+                cv_df = pd.concat([cv_df, rolling_df], ignore_index=True)
+            else:
+                cv_df = rolling_df
+
+        if _rolling_forecast_frames:
+            _rolling_raw = pd.concat(_rolling_forecast_frames, ignore_index=True)
+            # For each (unique_id, ds) keep the most recent fold's prediction
+            _rolling_raw = (
+                _rolling_raw
+                .sort_values("cutoff_date")
+                .drop_duplicates(subset=["unique_id", "ds"], keep="last")
+                .drop(columns=["cutoff_date"])
+            )
+            _q_col_list = [
+                getattr(q_cols, attr)
+                for attr in ("q025", "q10", "q25", "q50", "q75", "q90", "q975")
+                if getattr(q_cols, attr) is not None
+                and getattr(q_cols, attr) in _rolling_raw.columns
+            ]
+            _rolling_display = _invert_scaling_to_log1p(_rolling_raw, proc, cols=_q_col_list)
+            _rolling_display.to_parquet(PROCESSED_DIR / "rolling_forecast.parquet", index=False)
+            logger.info("Rolling forecast saved: {} rows.", len(_rolling_display))
+
     # ── 6. Inverse-transform for display  [INV-2] ────────────────────────────
     #   processed_display: TARGET_COL is unscaled log1p (dashboard actuals)
     #   forecast_display:  quantile cols are unscaled log1p (dashboard forecast)
@@ -788,10 +894,49 @@ def main() -> None:
         proc_dir   = PROCESSED_DIR,
         run_label  = _snap_label,
         counties   = active_counties,
-        phase      = "Phase 4",
+        phase      = "Phase 5",
         notes      = f"max_steps={max_steps}, skip_cv={skip_cv}",
     )
     console.print(f"  [bold green]Run snapshot saved:[/bold green] {_run_id}  →  {_run_dir}")
+
+    # ── 7c. Targeted outbreak-window validation (optional) ───────────────────
+    if args.outbreak_validation:
+        console.rule("[bold cyan] Outbreak Window Validation [/bold cyan]")
+        logger.info(
+            "Running targeted outbreak validation ({} windows) — "
+            "~500 steps per window.",
+            len(cfg.OUTBREAK_VALIDATION_WINDOWS),
+        )
+        _obv_trainer_kwargs = {
+            "enable_progress_bar":  False,
+            "enable_model_summary": False,
+            "early_stop_patience_steps": -1,
+        }
+        outbreak_results = run_outbreak_validation(
+            processed_df=sludge_all,
+            model_factory=lambda: WastewaterTFT(
+                max_steps=500, trainer_kwargs=_obv_trainer_kwargs
+            ),
+            windows=cfg.OUTBREAK_VALIDATION_WINDOWS,
+        )
+        if outbreak_results:
+            console.print("\n  [bold]Outbreak Validation Summary[/bold]")
+            console.print(
+                f"  {'Window':<20} {'Counties':>8} {'Cov95':>7} {'WIS':>7} "
+                f"{'Sens':>7} {'AUC':>7} {'Alerts':>7}"
+            )
+            console.print("  " + "─" * 65)
+            for obr in outbreak_results:
+                er   = obr.eval_result
+                sens = er.lead_time.sensitivity
+                console.print(
+                    f"  {obr.name:<20} {obr.n_counties:>8} "
+                    f"{er.coverage_95:>7.1%} {er.mean_wis:>7.3f} "
+                    f"{'N/A' if (isinstance(sens,float) and np.isnan(sens)) else f'{sens:>7.2f}'} "
+                    f"{er.lead_time.auc:>7.3f} {er.n_predicted_alerts:>7}"
+                )
+        else:
+            logger.warning("No outbreak validation windows completed successfully.")
 
     # ── 8. LLM public health bulletin (LM Studio) ────────────────────────────
     vsn_weights = model.variable_importance()
@@ -837,6 +982,8 @@ def main() -> None:
         ], ignore_index=True)
         dash_forecast  = pd.read_parquet(PROCESSED_DIR / "forecast.parquet")
         dash_q_cols    = QuantileColumns.auto_detect(dash_forecast)
+        _rolling_path  = PROCESSED_DIR / "rolling_forecast.parquet"
+        _dash_rolling  = pd.read_parquet(_rolling_path) if _rolling_path.exists() else pd.DataFrame()
 
         console.rule("[bold green] Launching Dash Dashboard [/bold green]")
         logger.info(
@@ -852,6 +999,7 @@ def main() -> None:
             liquid_df=liquid_all,             # is_sludge=0.0, SECONDARY_UNIT  [INV-3]
             q_cols=dash_q_cols,
             runs_dir=RUNS_DIR,               # enables run selector in dashboard
+            rolling_forecast_df=_dash_rolling,
         )
         app.run(host=DASH_HOST, port=args.port, debug=DASH_DEBUG)
 

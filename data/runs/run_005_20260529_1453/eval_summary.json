@@ -1,0 +1,18 @@
+{
+  "cutoff_date": null,
+  "mean_wis": 0.5719821018462139,
+  "coverage_50": 0.041666666666666664,
+  "coverage_95": 0.5,
+  "smape": 1.4815798285389536,
+  "n_actual_onsets": 0,
+  "n_predicted_alerts": 3,
+  "sensitivity": NaN,
+  "specificity": 0.0,
+  "auc": 0.5,
+  "mean_lead_days": NaN,
+  "mean_recovery_weeks": NaN,
+  "n_observations": 24,
+  "wis_06075": 0.7795926714188098,
+  "wis_06081": 0.5599403073999238,
+  "wis_06085": 0.376413326719908
+}

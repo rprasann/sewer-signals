@@ -670,6 +670,25 @@ class WastewaterProcessor:
             for lag_weeks in [1, 2, 3]:
                 df[f"{TARGET_COL}_lag{lag_weeks}w"] = case_grp.shift(lag_weeks)
 
+            # Phase-shift gravity: divergence between WW velocity and lagged case velocity.
+            #
+            #   ww_momentum_lead[t] = vel_concentration[t]
+            #                       − (log1p_cases[t-1] − log1p_cases[t-2])
+            #
+            # No leakage: vel_concentration uses WW at t and t-1 (hist_exog);
+            # the case velocity uses lag1w and lag2w, both strictly past.
+            #
+            # Sign semantics by epidemic phase:
+            #   Surge (leading edge)  → vel_conc > 0, vel_cases_lag ≈ 0  → strongly positive
+            #   Peak convergence      → vel_conc ≈ vel_cases_lag          → near zero
+            #   Downtick (tail)       → vel_cases_lag < 0, vel_conc ≈ 0   → positive residual
+            #                           prevents premature median collapse
+            #   Recovery confirmed    → both velocities negative, aligned  → near zero
+            df["ww_momentum_lead"] = (
+                df["vel_concentration"]
+                - (df[f"{TARGET_COL}_lag1w"] - df[f"{TARGET_COL}_lag2w"])
+            )
+
         # Z-score outlier flag on raw WW concentration (per-county)
         z = df.groupby(COUNTY_COL)["concentration"].transform(
             lambda s: (s - s.mean()) / (s.std() + 1e-8)
@@ -720,6 +739,7 @@ class WastewaterProcessor:
             "log1p_concentration_4w_ma",      # 4-week rolling mean
             "log1p_concentration_2w_std",     # 2-week rolling std (local volatility)
             "log1p_concentration_4w_std",     # 4-week rolling std (medium volatility)
+            "ww_momentum_lead",               # vel_conc[t] − vel_cases[t-1]: phase-shift gravity
         ]
         self._scale_cols = [c for c in candidates if c in df.columns]
         if not self._scale_cols:

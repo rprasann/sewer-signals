@@ -1,0 +1,22 @@
+{
+  "cutoff_date": null,
+  "mean_wis": 0.7225386386290399,
+  "coverage_50": 0.0,
+  "coverage_95": 0.03571428571428571,
+  "smape": 0.9461978028975876,
+  "n_actual_onsets": 0,
+  "n_predicted_alerts": 4,
+  "sensitivity": NaN,
+  "specificity": 0.42857142857142855,
+  "auc": 0.5,
+  "mean_lead_days": NaN,
+  "mean_recovery_weeks": NaN,
+  "n_observations": 56,
+  "wis_06001": 0.8547222021412119,
+  "wis_06013": 0.7461485991763708,
+  "wis_06041": 0.8691809658543267,
+  "wis_06075": 0.586815485248436,
+  "wis_06081": 0.4368556246306821,
+  "wis_06085": 0.42371757788411735,
+  "wis_06097": 1.1403300154681344
+}

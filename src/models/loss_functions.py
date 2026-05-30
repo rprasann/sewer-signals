@@ -333,10 +333,15 @@ class PINNWastewaterLoss(MQLoss):
         pinball = super().__call__(
             y=y, y_hat=y_hat, y_insample=y_insample, mask=mask
         )
-        # Phase 4: effective lambda scales with current pinball magnitude so the
-        # underdispersion penalty stays proportional throughout training.
-        effective_lambda = self.underdispersion_k * pinball.detach()
-        dyn_min_width = self._dynamic_min_width(y_insample, y_hat.device, y_hat.dtype)
+        # K-ratio scales the penalty proportionally to training loss magnitude, keeping
+        # it relevant early in training.  The clamp ensures it never fades to zero at
+        # convergence — without the floor, at train_loss≈0.02 the penalty drops to ~0.01,
+        # too weak to maintain PI width against the pinball gradient.
+        effective_lambda = torch.clamp(
+            self.underdispersion_k * pinball.detach(),
+            min=self.underdispersion_lambda,
+        )
+        dyn_min_width = self._dynamic_min_width(y_insample, y_hat)
         pinn = self._growth_penalty(y_hat, y_insample=y_insample)
         underdispersion = self._underdispersion_penalty(y_hat, effective_lambda, dyn_min_width)
         return pinball + pinn + underdispersion
@@ -386,36 +391,62 @@ class PINNWastewaterLoss(MQLoss):
 
         median = y_hat[:, :, :, self.median_idx]               # (B, H, N)
         step_change = median[:, 1:, :] - median[:, :-1, :]     # (B, H-1, N) absolute Δ
-        violation = torch.clamp(step_change - dyn_cap, min=0.0)
-        return self.growth_lambda * (violation ** 2).mean()
+
+        # Asymmetric gate — upward steps only; decays to zero at outbreak scale.
+        #
+        # Symmetric hard ceiling (old): penalises step_change > dyn_cap equally in
+        # both directions.  This suppressed legitimate surges alongside hallucinations.
+        #
+        # Asymmetric sigmoid gate (new):
+        #   gate ≈ 1  when upward << dyn_cap  (noise zone: small compounding steps)
+        #   gate ≈ 0  when upward >> dyn_cap  (outbreak zone: genuine surge, unconstrained)
+        # Result: the model is incentivised to either stay flat OR commit to a
+        # genuine outbreak-scale jump — ambiguous noise-level growth is penalised.
+        upward = step_change.clamp(min=0.0)
+        gate   = torch.sigmoid(4.0 * (dyn_cap - upward) / (dyn_cap + 1e-6))
+        return self.growth_lambda * (upward * gate).pow(2).mean()
 
     def _dynamic_min_width(
         self,
         y_insample,
-        device: torch.device,
-        dtype: torch.dtype,
+        y_hat: torch.Tensor,
     ) -> torch.Tensor:
-        """Compute per-sample dynamic minimum PI width from insample volatility.
+        """Compute per-sample dynamic minimum PI width using two volatility sources.
 
-        Uses the std of the last 4 insample steps as a local volatility proxy.
-        Returns a ``[B, 1, 1]`` tensor that broadcasts over H and N dimensions.
-        Falls back to ``min_pi_width_floor`` when y_insample is None or too short.
+        1. ``case_vol`` — std of last 4 insample case steps (lagging, confirmed).
+
+        2. ``forecast_vol`` — std of predicted median across H forecast steps (leading).
+           When ww_momentum_lead or vel_concentration has driven the model to predict
+           a volatile trajectory, this rises even if recent cases are quiet — proxying
+           WW-signal-driven uncertainty without requiring WW data in the loss function.
+           Computed with .detach() so no gradients flow back through this path.
+
+        Floor = max(case_vol, forecast_vol) × multiplier, clamped to min_pi_width.
+        This couples PI width to BOTH lagging case history AND leading forecast
+        trajectory — the structural gap where PI stayed narrow during WW-driven
+        surge onset (cases quiet, WW rising) is now addressed.
         """
+        device = y_hat.device
+        dtype  = y_hat.dtype
+
         if y_insample is None or self.min_pi_width_multiplier <= 0:
-            # Fall back to the Phase 3 static floor (2.5), not min_pi_width_floor (0.5).
-            # When y_insample is absent the dynamic path is unavailable; using the
-            # smaller 0.5 floor would regress underdispersion protection 5× vs Phase 3.
             return torch.tensor(self.min_pi_width, device=device, dtype=dtype)
 
-        # y_insample: [B, T, N] or [B, T] — squeeze N if present
+        # ── 1. Case history vol (lagging) ─────────────────────────────────────
         ys = y_insample.squeeze(-1) if y_insample.dim() == 3 else y_insample  # [B, T]
-        n_steps = min(4, ys.shape[1])
-        recent = ys[:, -n_steps:].float()                     # [B, n_steps]
-        vol = recent.std(dim=1, keepdim=True)                 # [B, 1]
-        # clamp NaN (e.g. n_steps=1 makes std=NaN)
-        vol = torch.nan_to_num(vol, nan=0.0)
-        dyn = (self.min_pi_width_multiplier * vol).clamp(min=self.min_pi_width_floor)
-        return dyn.unsqueeze(-1)                              # [B, 1, 1] for H×N broadcast
+        n_steps  = min(4, ys.shape[1])
+        case_vol = ys[:, -n_steps:].float().std(dim=1, keepdim=True)           # [B, 1]
+        case_vol = torch.nan_to_num(case_vol, nan=0.0)
+
+        # ── 2. Forecast trajectory vol (WW-proxy, leading) ────────────────────
+        forecast_median = y_hat[:, :, :, self.median_idx]      # [B, H, N]
+        forecast_median = forecast_median.squeeze(-1)           # [B, H]
+        forecast_vol    = forecast_median.std(dim=1, keepdim=True).detach()    # [B, 1]
+        forecast_vol    = torch.nan_to_num(forecast_vol, nan=0.0)
+
+        effective_vol = torch.maximum(case_vol, forecast_vol)
+        dyn = (self.min_pi_width_multiplier * effective_vol).clamp(min=self.min_pi_width)
+        return dyn.unsqueeze(-1)                               # [B, 1, 1] for H×N broadcast
 
     def _underdispersion_penalty(
         self,

@@ -113,7 +113,7 @@ Val and test splits call `transform()` with the stored scaler. Target lags
 | Local volatility | `log1p_concentration_2w_std` | 2 | 2-week local volatility |
 | Local volatility | `log1p_concentration_4w_std` | 2 | 4-week medium volatility |
 
-### Key Hyperparameters (current Phase 4 entry state)
+### Key Hyperparameters (current Phase 5 entry state)
 
 | Parameter | Value | Rationale |
 |---|---|---|
@@ -128,19 +128,26 @@ Val and test splits call `transform()` with the stored scaler. Target lags
 ### Loss Function: PINNWastewaterLoss (`src/models/loss_functions.py`)
 
 - **Base:** `MQLoss` (NeuralForecast pinball loss)
-- **PINN growth-rate penalty:** `GROWTH_RATE_LAMBDA = 0.0` (disabled since Phase 2)
-- **Underdispersion penalty:** Penalises 95% PI narrower than `MIN_PI_WIDTH` scaled units.
-  `UNDERDISPERSION_LAMBDA = 0.5` (Phase 3 static value; Phase 4 target: make dynamic)
-- **Minimum PI width:** `MIN_PI_WIDTH = 2.5` scaled units
-  (Phase 3 static value; Phase 4 target: replace with `multiplier × σ_t`)
-- **domain_map:** Identity reshape only — Softplus **removed** (Phase 2) because
-  RobustScaled target is legitimately negative; Softplus collapsed all quantiles to zero
+- **domain_map (Phase 4):** Median-anchored cumulative softplus. Q[0.50] is the
+  unconstrained raw output (τ=0.5 pinball gradient is strongest → median stays
+  anchored to true conditional median). Lower quantiles built downward via
+  reverse-cumsum of softplus increments; upper quantiles built upward symmetrically.
+  Monotonicity guaranteed by construction.
+- **Underdispersion penalty (Phase 4):** `effective_lambda = UNDERDISPERSION_K × pinball_loss`
+  (dynamic — scales with training progress). Falls back to static `UNDERDISPERSION_LAMBDA = 0.5`
+  when `UNDERDISPERSION_K = 0` (ablation only).
+- **Minimum PI width (Phase 4):** `min_width_t = MIN_PI_WIDTH_MULTIPLIER × σ(y_insample[-4:])`
+  clamped to `MIN_PI_WIDTH_FLOOR = 0.5`. Falls back to static `MIN_PI_WIDTH = 2.5` when
+  `y_insample` is None (Phase 3 legacy fallback preserved to avoid coverage regression).
+- **PINN growth-rate penalty:** `GROWTH_RATE_LAMBDA = 0.0` (disabled — Phase 5 will
+  re-enable at ~0.005 once median-anchor stability is confirmed). Dynamic step-change cap
+  infrastructure is wired: `dyn_cap = STEP_CHANGE_MULTIPLIER × σ(y_insample[-4:])`.
 
 ### Outbreak Detection: `OutbreakDetector` (`src/evaluation/metrics.py`)
 
-- **Current trigger:** `OUTBREAK_GROWTH_THRESHOLD = 0.25` — static 25% WoW growth
-  (Phase 3: lowered from 0.40 to improve AUC sensitivity)
-- **Phase 4 target:** Rolling z-score: `z = (x_t - μ_8w) / σ_8w > Z_THRESHOLD`
+- **Current trigger (Phase 4):** Z-score mode by default — `z = (x_t − μ_8w) / σ_8w ≥ Z_OUTBREAK_THRESHOLD = 2.0`
+  using an 8-week (`Z_SCORE_BASELINE_WEEKS`) rolling baseline computed from the *preceding* period (shift(1) prevents leakage).
+- **Legacy fallback:** `OUTBREAK_GROWTH_THRESHOLD = 0.25` — used only when `OutbreakDetector(z_threshold=None)` is passed explicitly.
 
 ---
 
@@ -243,4 +250,5 @@ Examples: `"Merged WW Concentrations & Weekly Cases — 4 Illustrative Counties\
 | 1 | Initial Baseline | Single-county TFT on Santa Clara; target = log1p_concentration |
 | 2 | Momentum Pivot | Target → log1p_new_cases; 7 quantiles; horizon_weight; 15 HIST_COVARIATES; identity scaler |
 | 3 | PoC Breakthrough | Underdispersion penalty; MIN_PI_WIDTH; accel_concentration; vel_concentration_lag1w; 3-county validation; data extended to 2023-12-19; 17 HIST_COVARIATES |
-| **4** | **Heuristics to Dynamics** | **Replace static λ, MIN_PI_WIDTH, OUTBREAK_GROWTH_THRESHOLD with dynamic computations** |
+| 4 | Heuristics to Dynamics | Median-anchored cumulative softplus domain_map; dynamic effective_lambda (UNDERDISPERSION_K=0.5); dynamic min PI width (MIN_PI_WIDTH_MULTIPLIER=2.0); Z-score outbreak trigger (Z_OUTBREAK_THRESHOLD=2.0); dynamic step-change cap wired (λ=0) |
+| **5** | **Reliability & Detection** | **Verify y_insample liveness; capture baseline metrics; re-enable GROWTH_RATE_LAMBDA; final calibration** |

@@ -6,60 +6,38 @@
 
 ---
 
-## Current Phase: Phase 4 — "Heuristics to Dynamics" (Starting)
+## Current Phase: Phase 5 — "Reliability & Detection" (Ongoing)
 
-**Objective:** Replace the three hard-coded "magic numbers" that were validated
-in the Phase 3 PoC with dynamic, statistically-grounded computations. The
-goal is an auto-calibrating model that does not require manual threshold tuning
-when the data distribution shifts (new waves, new counties, new variants).
+**Objective:** Verify that all Phase 4 dynamic mechanisms are actually live at
+training time, then re-enable the `GROWTH_RATE_LAMBDA` growth-rate penalty to
+restore biological plausibility without flattening PI spread.
 
-**Phase 3 Status:** ✅ Complete — PoC breakthrough confirmed on 3-county validation
-(San Francisco, San Mateo, Santa Clara). Hard-coded heuristics broke the
-"Smoothing Engine" and achieved non-zero PI coverage. Values are now the
-baseline to replace.
+**Phase 4 Status:** ✅ Complete — All three dynamic replacements implemented in
+code. Median-anchored cumulative softplus domain_map provides structural
+monotonicity. Key open question: whether NeuralForecast actually passes
+`y_insample` to the loss (which activates the dynamic min-width and
+step-change cap paths). The first training run will log INFO or WARNING to
+resolve this (see Phase 5 Step 1 below).
 
 ---
 
-## The PoC Baseline (Phase 3 Hard-Coded Heuristics)
+## Phase 4 Summary (Completed)
 
-These are the values that worked in Phase 3. Phase 4 must replace each one
-with a dynamic equivalent that achieves the same or better performance.
+### What Phase 4 Built
 
-| Constant | Value | Purpose | Phase 4 Replacement Target |
+| Change | Before (Phase 3) | After (Phase 4) | Where |
 |---|---|---|---|
-| `UNDERDISPERSION_LAMBDA` | `0.5` | Makes underdispersion penalty competitive with Pinball loss | **Scale-Aware Lambda**: `λ = k × mean_pinball_loss` |
-| `MIN_PI_WIDTH` | `2.5` | Minimum 95% PI width in scaled units (~86% of theoretical Gaussian width) | **Volatility-Adjusted Width**: `w = m × rolling_std(signal, 4w)` |
-| `OUTBREAK_GROWTH_THRESHOLD` | `0.25` | 25% WoW increase flags onset (Phase 3: lowered from 0.40 for AUC) | **Z-score / Percentile Trigger**: `z > Z_THRESHOLD` or `pct > P_THRESHOLD` |
+| `domain_map` | Identity reshape (Softplus removed in P2) | **Median-anchored cumulative softplus** — Q[0.50] is unconstrained anchor; lower/upper quantiles built via softplus increments; monotonicity guaranteed | `loss_functions.py` |
+| Underdispersion lambda | `UNDERDISPERSION_LAMBDA = 0.5` (static) | `effective_lambda = UNDERDISPERSION_K × pinball_loss` — scales with loss magnitude so penalty stays proportional throughout training | `config.py` + `loss_functions.py` |
+| Minimum PI width | `MIN_PI_WIDTH = 2.5` (static, scaled units) | `min_width_t = MIN_PI_WIDTH_MULTIPLIER × σ(y_insample[-4:])` clamped to `MIN_PI_WIDTH_FLOOR`; falls back to 2.5 if `y_insample` absent | `loss_functions.py` |
+| Outbreak trigger | `OUTBREAK_GROWTH_THRESHOLD = 0.25` (static WoW) | `OutbreakDetector` defaults to Z-score mode: `z = (x_t − μ_8w) / σ_8w ≥ Z_OUTBREAK_THRESHOLD` | `metrics.py` + `config.py` |
+| Step-change cap | Relative-rate formula (pathological near zero) | `dyn_cap = STEP_CHANGE_MULTIPLIER × σ(y_insample[-4:])` clamped to `MAX_WEEKLY_STEP_CHANGE`; **wired but inactive** (`GROWTH_RATE_LAMBDA = 0.0`) | `loss_functions.py` |
 
----
-
-## Phase 4 Refactoring Targets
-
-### Target 1: Scale-Aware Lambda
-**Current:** `UNDERDISPERSION_LAMBDA = 0.5` (static)
-**Goal:** `λ_effective = k × mean_pinball_loss` where `k` is a dimensionless ratio
-(target: penalty ≈ 50% of base loss magnitude at initialisation).
-**Why static fails:** As Pinball loss drops during training, the underdispersion
-penalty increasingly dominates, eventually fighting the calibration it was meant
-to help.
-**Files to change:** `src/models/loss_functions.py`, `src/config.py`
-
-### Target 2: Volatility-Adjusted Minimum Width
-**Current:** `MIN_PI_WIDTH = 2.5` (static, in scaled units)
-**Goal:** `min_width_t = multiplier × σ_t` where σ_t is the 4-week rolling std
-of `log1p_concentration` for that county-week.
-**Why static fails:** A flat floor is too wide for low-variance periods (over-
-penalises) and too narrow for high-variance surge onsets (under-penalises).
-**Files to change:** `src/models/loss_functions.py`, `src/data_pipeline/processor.py`
-(add `rolling_std` as a passed-in covariate or compute inline in loss)
-
-### Target 3: Statistical Significance Outbreak Trigger
-**Current:** `OUTBREAK_GROWTH_THRESHOLD = 0.25` (static 25% WoW)
-**Goal:** Z-score relative to rolling baseline: `z = (x_t - μ_baseline) / σ_baseline`
-where baseline = 8-week rolling mean/std. Alert when `z > Z_THRESHOLD`.
-**Why static fails:** 25% growth is noise in a high-variance wave but significant
-in a quiet inter-wave period — same threshold, opposite meaning.
-**Files to change:** `src/evaluation/metrics.py`, `src/config.py`
+### Phase 4 Key Open Question
+Whether `y_insample` is passed by NeuralForecast to `PINNWastewaterLoss.__call__`.
+On the first training forward pass the loss logs:
+- `INFO "y_insample RECEIVED"` → dynamic min-width and step-change cap are live
+- `WARNING "y_insample ABSENT"` → static Phase 3 fallbacks (`MIN_PI_WIDTH = 2.5`) are in use
 
 ---
 
@@ -90,7 +68,7 @@ and two new derivative features. Validated on 3-county set.
 
 ## Current Architecture Snapshot
 
-### HIST_COVARIATES (17 features)
+### HIST_COVARIATES (18 features)
 
 | Group | Feature | Phase Added |
 |---|---|---|
@@ -103,20 +81,28 @@ and two new derivative features. Validated on 3-county set.
 | Momentum context | `vel_concentration_lag1w` | 3 |
 | Rolling baseline | `log1p_concentration_2w_ma`, `log1p_concentration_4w_ma` | 2 |
 | Local volatility | `log1p_concentration_2w_std`, `log1p_concentration_4w_std` | 2 |
+| Biological gravity | `ww_case_ratio` | 5 |
 
-### Key Config Values (current state entering Phase 4)
+### Key Config Values (Phase 5 — post RC-1/RC-2 fixes)
 
-| Parameter | Value |
-|---|---|
-| `UNDERDISPERSION_LAMBDA` | 0.5 (static — Phase 4 target) |
-| `MIN_PI_WIDTH` | 2.5 (static — Phase 4 target) |
-| `OUTBREAK_GROWTH_THRESHOLD` | 0.25 (static — Phase 4 target) |
-| `GROWTH_RATE_LAMBDA` | 0.0 (PINN disabled) |
-| `n_quantiles` | 7 |
-| `quantile_levels` | [0.025, 0.10, 0.25, 0.50, 0.75, 0.90, 0.975] |
-| `horizon_weight` | [2.0, 2.0, 1.5, 1.5, 1.0, 1.0, 0.8, 0.8] |
-| `scaler_type` | "identity" |
-| Holdout window | 2023-06-08 → 2023-12-19 (28 W) |
+| Parameter | Value | Status |
+|---|---|---|
+| `UNDERDISPERSION_K` | 0.5 | **Phase 4 active** — effective_lambda = clamp(K × pinball_loss, min=LAMBDA) |
+| `UNDERDISPERSION_LAMBDA` | 0.5 | **Phase 5 floor** — guarantees penalty ≥ 0.5 at convergence (was Phase 3 legacy/unused) |
+| `MIN_PI_WIDTH_MULTIPLIER` | **3.0** | **Phase 5** — raised from 2.0; activates above Phase 3 floor at σ>0.83 (was σ>1.25) |
+| `MIN_PI_WIDTH_FLOOR` | **1.5** | **Phase 5** — raised from 0.5; last-resort safety net (primary floor = MIN_PI_WIDTH) |
+| `MIN_PI_WIDTH` | 2.5 | Static fallback when y_insample absent — not used as dynamic floor |
+| `GROWTH_RATE_LAMBDA` | **0.005** | **Phase 5 active** — asymmetric sigmoid gate (upward-only, decays at outbreak scale) |
+| `STEP_CHANGE_MULTIPLIER` | 3.0 | Wired, inactive while λ=0 |
+| `MAX_WEEKLY_STEP_CHANGE` | 1.5 | Static floor / fallback for step-change cap |
+| `Z_OUTBREAK_THRESHOLD` | 2.0 | **Phase 4 active** — Z-score onset trigger |
+| `Z_SCORE_BASELINE_WEEKS` | 8 | **Phase 4 active** — rolling baseline window |
+| `OUTBREAK_GROWTH_THRESHOLD` | 0.25 | Phase 3 legacy — used only when z_threshold=None |
+| `n_quantiles` | 7 | unchanged |
+| `quantile_levels` | [0.025, 0.10, 0.25, 0.50, 0.75, 0.90, 0.975] | unchanged |
+| `horizon_weight` | [2.0, 2.0, 1.5, 1.5, 1.0, 1.0, 0.8, 0.8] | unchanged |
+| `scaler_type` | "identity" | unchanged |
+| Holdout window | 2023-06-08 → 2023-12-19 (28 W) | unchanged |
 
 ---
 
@@ -132,8 +118,12 @@ harmless — the scaler skips those columns.
 in `main.py` logs ~25 `[INV-NAN]` warnings for warmup NaN rows (first 1–3 rows
 per county per lag/diff feature). Expected and handled automatically.
 
-### 3. Short-history counties (Napa, Solano, Sonoma, Marin, Contra Costa)
-5 counties have fewer than `INPUT_SIZE + H = 34` training weeks in early folds.
+### 3. Short-history counties (Sonoma, Marin, Contra Costa)
+Napa and Solano are now **explicitly excluded** via `EXCLUDE_FIPS` in `config.py` —
+they had 2 and 3 training weeks respectively, near-zero IQR scalers (0.089–0.146),
+and were already being dropped silently by the NaN filter. They are not on the dashboard.
+The remaining 3 short-history counties (Sonoma=15w, Marin=16w, Contra Costa=29w)
+have fewer than `INPUT_SIZE + H = 34` training weeks in early folds.
 `start_padding_enabled=True` zero-pads them.
 
 ### 4. CV models use `val_size=0` + `early_stop_patience_steps=-1`
@@ -154,27 +144,38 @@ A plain Python list raises `AttributeError`. Always pass
 
 ---
 
-## Immediate Next Steps (Phase 4)
+## Immediate Next Steps (Phase 5)
 
-1. **Analysis — understand heuristic coupling:** Before replacing any constant,
-   run `python main.py --skip-cv --no-dash` to get a clean baseline metric
-   snapshot (coverage_50, coverage_95, mean_wis, smape, AUC).
+### Completed
+- ✅ **y_insample liveness confirmed:** `INFO y_insample RECEIVED` shape=(7,26,1).
+  Dynamic min-width and step-change cap are live.
+- ✅ **Phase 5 baseline captured** (run_003): coverage_95=3.6%, coverage_50=0%,
+  WIS=0.723, SMAPE=0.946. Root causes identified: K-ratio penalty fading at
+  convergence (RC-1) and dynamic min_width floor below Phase 3 in calm periods (RC-2).
+- ✅ **RC-1 fixed:** `effective_lambda = clamp(K × pinball, min=UNDERDISPERSION_LAMBDA)`
+  — penalty floor restored to Phase 3 strength (0.5) at convergence.
+- ✅ **RC-2 fixed:** `_dynamic_min_width` now uses a two-tier vol approach — `local_vol`
+  (last 4 steps, reactive) and `global_vol` (full insample, stable baseline per series).
+  Floor = `multiplier × global_vol` clamped to `MIN_PI_WIDTH_FLOOR` (absolute last resort).
+  From run_003 data: well-behaved counties have global_std≈0.62–0.72 in scaled space →
+  floor≈1.85–2.15 per series, data-driven. `global_vol` capped at 2.0 to guard sparse counties.
+  `MIN_PI_WIDTH_MULTIPLIER` raised 2.0→3.0. `MIN_PI_WIDTH_FLOOR` raised 0.5→1.5.
 
-2. **Target 1 — Scale-Aware Lambda:** Implement `λ_effective` as a function of
-   running mean Pinball loss in `PINNWastewaterLoss.forward()`. Add
-   `UNDERDISPERSION_K` ratio constant to `config.py`.
+### Phase 5 Latest (post-run_004)
+- **coverage_95 = 46.4%** (up from 3.6%) — RC-1/RC-2 confirmed working
+- **coverage_50 = 0.0%** — median displacement; requires RC-3 (dropout fix)
+- **5 false positive alerts** — GROWTH_RATE_LAMBDA still 0.0 at that point
 
-3. **Target 2 — Volatility-Adjusted Width:** Compute `σ_t` from
-   `log1p_concentration_4w_std` (already in HIST_COVARIATES). Pass it into
-   the loss via the batch tensor; replace scalar `MIN_PI_WIDTH` with
-   per-sample `min_width_t = multiplier × σ_t`.
+### Changes Implemented
+- `GROWTH_RATE_LAMBDA = 0.005` re-enabled with **asymmetric sigmoid gate** (upward-only, decays at outbreak scale)
+- `ww_case_ratio = log1p_concentration − log1p_new_cases` added as HIST_COVARIATE 18
+- Dropout raised 0.1 → 0.3, attn_dropout 0.1 → 0.3 (RC-3: overfitting)
+- `run_outbreak_validation()` + `--outbreak-validation` CLI flag added
 
-4. **Target 3 — Z-score Trigger:** Replace `OutbreakDetector` growth threshold
-   with a rolling z-score in `metrics.py`. Add `Z_OUTBREAK_THRESHOLD` to
-   `config.py`; deprecate `OUTBREAK_GROWTH_THRESHOLD`.
-
-5. **Regression check:** After each target, re-run evaluation and confirm
-   coverage_95 ≥ Phase 3 baseline.
+### Next
+1. **Run `--skip-cv --no-dash`** — confirm coverage_95 holds ≥ 40% and false positives drop.
+2. **Run `--outbreak-validation`** — verify sensitivity > 0 on Windows 2–4.
+3. If coverage_50 still 0%: increase `UNDERDISPERSION_K` or tune dropout further.
 
 ---
 
@@ -232,13 +233,16 @@ fig.suptitle("Specific Descriptive Title — What Is Featured\nSubtitle: key det
 
 | File | Last significant change |
 |---|---|
-| `src/config.py` | Phase 3: UNDERDISPERSION_LAMBDA=0.5, MIN_PI_WIDTH=2.5, OUTBREAK_GROWTH_THRESHOLD=0.25, data dates extended to 2023-12-19 |
-| `src/data_pipeline/processor.py` | Phase 3: accel_concentration + vel_concentration_lag1w added |
-| `src/models/tft_model.py` | Phase 3: HIST_COVARIATES 15→17 (accel_concentration, vel_concentration_lag1w) |
-| `src/models/loss_functions.py` | **Phase 4**: cumulative-softplus domain_map (monotonicity); fallback floor restored to MIN_PI_WIDTH=2.5 |
+| `src/config.py` | **Phase 5**: EXCLUDE_FIPS=[06055,06095] (Napa+Solano); MIN_PI_WIDTH_MULTIPLIER 2.0→3.0; MIN_PI_WIDTH_FLOOR 0.5→1.5 |
+| `main.py` | **Phase 5**: EXCLUDE_FIPS filter applied after raw load; snapshot phase label Phase 4→Phase 5 |
+| `src/models/loss_functions.py` | **Phase 5**: effective_lambda floor (RC-1); two-tier global/local vol floor (RC-2); asymmetric sigmoid growth gate (GROWTH_RATE_LAMBDA=0.005) |
+| `src/data_pipeline/processor.py` | **Phase 5**: ww_case_ratio added to _add_lag_features() + _apply_scaling candidates |
+| `src/models/tft_model.py` | **Phase 5**: ww_case_ratio added to HIST_COVARIATES (17→18) |
+| `src/evaluation/metrics.py` | **Phase 5**: OutbreakWindowResult dataclass + run_outbreak_validation() |
+| `src/evaluation/metrics.py` | **Phase 4**: OutbreakDetector defaults to Z-score mode; LeadTimeEvaluator Z-score scoring; evaluate() opts into Z_SCORE_BASELINE_WEEKS |
 | `src/data_pipeline/processor.py` | **Phase 4**: save_scalers() / load_scalers() — scaler persistence to disk |
 | `main.py` | **Phase 4**: proc.save_scalers() after processing; _invert_scaling_to_log1p auto-loads; all exports in unscaled log1p |
-| `src/evaluation/metrics.py` | Phase 3: OUTBREAK_GROWTH_THRESHOLD=0.25; no-overlap guard |
+| `src/models/tft_model.py` | Phase 3: HIST_COVARIATES 15→17 (accel_concentration, vel_concentration_lag1w) |
 | `src/visualization/attention_plots.py` | Phase 2: Full colour palette refactor |
 | `src/visualization/dashboard.py` | Phase 2: Accent colour updated |
 | `src/utils/helpers.py` | Phase 2: LLM prompt updated for case target |

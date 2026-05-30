@@ -692,15 +692,16 @@ def _build_run_scorecard(eval_dict: dict) -> html.Div:
 # ---------------------------------------------------------------------------
 
 def create_app(
-    processed_df:  pd.DataFrame,
-    forecast_df:   pd.DataFrame,
-    model          = None,
-    sludge_df:     Optional[pd.DataFrame] = None,
-    liquid_df:     Optional[pd.DataFrame] = None,
-    q_cols:        Optional[QuantileColumns] = None,
-    eval_result    = None,
-    cv_results:    Optional[pd.DataFrame] = None,
-    runs_dir:      Optional[Path] = None,
+    processed_df:        pd.DataFrame,
+    forecast_df:         pd.DataFrame,
+    model                = None,
+    sludge_df:           Optional[pd.DataFrame] = None,
+    liquid_df:           Optional[pd.DataFrame] = None,
+    q_cols:              Optional[QuantileColumns] = None,
+    eval_result          = None,
+    cv_results:          Optional[pd.DataFrame] = None,
+    runs_dir:            Optional[Path] = None,
+    rolling_forecast_df: Optional[pd.DataFrame] = None,
 ) -> dash.Dash:
     """Build and return the Sewer Surveillance production dashboard.
 
@@ -727,6 +728,9 @@ def create_app(
 
     # Build initial CV frame
     _initial_cv = cv_results if (cv_results is not None and not cv_results.empty) else pd.DataFrame()
+
+    # Initial rolling forecast (may be empty if run was not --rolling-holdout)
+    _initial_rolling = rolling_forecast_df if rolling_forecast_df is not None else pd.DataFrame()
 
     # VSN weights (pre-extracted if model available)
     _vsn_weights: dict = {}
@@ -818,12 +822,25 @@ def create_app(
 
             # ── Row 1: Hero + Map ────────────────────────────────────────────
             dbc.Row([
-                dbc.Col(_card([dcc.Graph(
-                    id="hero-chart",
-                    config={"displayModeBar": True,
-                            "modeBarButtonsToRemove": ["select2d", "lasso2d"],
-                            "displaylogo": False},
-                )]), width=8),
+                dbc.Col(_card([
+                    dcc.RadioItems(
+                        id="forecast-view-toggle",
+                        options=[
+                            {"label": "  Final 8-week forecast", "value": "final"},
+                            {"label": "  Full rolling holdout (28 weeks)", "value": "rolling"},
+                        ],
+                        value="final",
+                        inline=True,
+                        style={"fontSize": "12px", "color": _MUTED, "marginBottom": "10px"},
+                        inputStyle={"marginRight": "4px", "marginLeft": "12px"},
+                    ),
+                    dcc.Graph(
+                        id="hero-chart",
+                        config={"displayModeBar": True,
+                                "modeBarButtonsToRemove": ["select2d", "lasso2d"],
+                                "displaylogo": False},
+                    ),
+                ]), width=8),
                 dbc.Col(_card([dcc.Graph(
                     id="map-chart",
                     config={"displayModeBar": False},
@@ -882,17 +899,15 @@ def create_app(
 
     # ── Helpers inside create_app closure ────────────────────────────────────
 
-    def _get_run_data(run_dir_str: str) -> tuple[pd.DataFrame, pd.DataFrame, QuantileColumns, pd.DataFrame, dict]:
-        """Return (processed_df, forecast_df, q_cols, cv_df, eval_dict) for the selected run.
-        Returns the live (passed-in) data for '__live__' or unknown values.
-        """
+    def _get_run_data(run_dir_str: str) -> tuple[pd.DataFrame, pd.DataFrame, QuantileColumns, pd.DataFrame, dict, pd.DataFrame]:
+        """Return (processed_df, forecast_df, q_cols, cv_df, eval_dict, rolling_df) for the selected run."""
         if run_dir_str == "__live__" or not run_dir_str:
-            return processed_df, forecast_df, q_cols, _initial_cv, _initial_eval_dict
+            return processed_df, forecast_df, q_cols, _initial_cv, _initial_eval_dict, _initial_rolling
         try:
             return load_run_data(Path(run_dir_str))
         except Exception as exc:
             logger.warning("Failed to load run {}: {}", run_dir_str, exc)
-            return processed_df, forecast_df, q_cols, _initial_cv, _initial_eval_dict
+            return processed_df, forecast_df, q_cols, _initial_cv, _initial_eval_dict, _initial_rolling
 
     # ── Map click → county selection ─────────────────────────────────────────
     @app.callback(
@@ -910,7 +925,7 @@ def create_app(
         return None if fips == current_fips else fips
 
     # ── Main panels: hero + map + timeline ───────────────────────────────────
-    main_inputs = [Input("selected-county", "data")]
+    main_inputs = [Input("selected-county", "data"), Input("forecast-view-toggle", "value")]
     if has_run_selector:
         main_inputs.append(Input("run-selector", "value"))
 
@@ -923,19 +938,24 @@ def create_app(
     )
     def update_main_panels(*args):
         county_fips  = args[0]
-        run_dir_str  = args[1] if len(args) > 1 else "__live__"
-        pd_df, fc_df, qc, _, _ = _get_run_data(run_dir_str)
+        view_mode    = args[1] if len(args) > 1 else "final"
+        run_dir_str  = args[2] if len(args) > 2 else "__live__"
+        pd_df, fc_df, qc, _, _, rolling_df = _get_run_data(run_dir_str)
+
+        use_rolling = (view_mode == "rolling") and not rolling_df.empty
+        display_fc  = rolling_df if use_rolling else fc_df
+        horizon_label = "28-week rolling holdout" if use_rolling else "8-week horizon"
 
         county_name = FIPS_TO_COUNTY.get(county_fips, county_fips) if county_fips else None
-        n_counties  = fc_df["unique_id"].nunique() if not fc_df.empty else 0
+        n_counties  = display_fc["unique_id"].nunique() if not display_fc.empty else 0
         badge = (
-            f"Focused on: {county_name}  ·  8-week horizon  ·  click again to deselect"
+            f"Focused on: {county_name}  ·  {horizon_label}  ·  click again to deselect"
             if county_name else
-            f"{n_counties} {'County' if n_counties==1 else 'Counties'}  ·  8-week horizon  ·  click a county to focus"
+            f"{n_counties} {'County' if n_counties==1 else 'Counties'}  ·  {horizon_label}  ·  click a county to focus"
         )
-        hero     = create_hero_plot(pd_df, fc_df, county_fips, qc)
-        map_fig  = create_map(fc_df, qc, selected_fips=county_fips)
-        timeline = create_timeline_chart(pd_df, fc_df, county_fips, qc)
+        hero     = create_hero_plot(pd_df, display_fc, county_fips, qc)
+        map_fig  = create_map(display_fc, qc, selected_fips=county_fips)
+        timeline = create_timeline_chart(pd_df, display_fc, county_fips, qc)
         return hero, map_fig, timeline, badge
 
     # ── Diagnostic panels: bio table + county WIS + CV chart ─────────────────
@@ -952,7 +972,7 @@ def create_app(
     )
     def update_diagnostics(*args):
         run_dir_str = args[1] if len(args) > 1 else "__live__"
-        _, _, _, cv_df_run, eval_dict_run = _get_run_data(run_dir_str)
+        _, _, _, cv_df_run, eval_dict_run, _ = _get_run_data(run_dir_str)
 
         bio_tbl    = _build_bio_table(eval_dict_run if eval_dict_run else None)
         wis_chart  = _build_county_wis_chart(eval_dict_run)

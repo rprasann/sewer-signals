@@ -47,8 +47,6 @@ from rich.progress import (
     TimeElapsedColumn,
     TimeRemainingColumn,
 )
-from sklearn.metrics import roc_auc_score, roc_curve
-
 from src.config import (
     COUNTY_COL,
     LEAD_TIME_WINDOW_MIN,
@@ -56,6 +54,7 @@ from src.config import (
     NWSS_DATE_COL,
     OUTBREAK_GROWTH_THRESHOLD,
     OUTBREAK_SUSTAINED_DAYS,
+    QUANTILE_LEVELS,
     TARGET_COL,
     TRAIN_END_DATE,
     VAL_END_DATE,
@@ -1024,6 +1023,130 @@ def evaluate(
 
 
 # ---------------------------------------------------------------------------
+# Targeted outbreak-window validation
+# ---------------------------------------------------------------------------
+
+@dataclass
+class OutbreakWindowResult:
+    """Evaluation result for one historical outbreak validation window."""
+    name:        str
+    eval_start:  str
+    eval_end:    str
+    n_counties:  int
+    eval_result: EvalResult
+
+
+def run_outbreak_validation(
+    processed_df: pd.DataFrame,
+    model_factory: Callable[[], Any],
+    windows: list[dict],
+) -> list[OutbreakWindowResult]:
+    """Train and evaluate one model per historical outbreak window.
+
+    For each window the model is trained on all data up to 1 week before
+    ``eval_start``, then asked to forecast H steps starting from ``eval_start``.
+    This simulates operational deployment: the model never sees data from
+    the outbreak period it is being asked to detect.
+
+    Parameters
+    ----------
+    processed_df  : Full scaled dataset (all splits concatenated).
+    model_factory : Callable returning a fresh, unfitted model — should use
+                    fast settings (e.g. max_steps=500, no progress bar).
+    windows       : List of dicts with keys:
+                      name        — display label
+                      eval_start  — ISO date string (W-WED)
+                      eval_end    — ISO date string (W-WED)
+                      counties    — list of FIPS strings, or None for all
+    """
+    model_h: int = getattr(model_factory(), "h", 8)
+    results: list[OutbreakWindowResult] = []
+
+    for win in windows:
+        name       = win["name"]
+        eval_start = pd.Timestamp(win["eval_start"])
+        eval_end   = pd.Timestamp(win["eval_end"])
+        counties   = win.get("counties")
+
+        df_win = (
+            processed_df[processed_df[COUNTY_COL].isin(counties)].copy()
+            if counties else processed_df.copy()
+        )
+        if df_win.empty:
+            logger.warning("Outbreak window '{}': no data for counties {}. Skipping.", name, counties)
+            continue
+
+        # Train cutoff: 1 week before eval_start so the FIRST forecast step
+        # lands exactly on eval_start, covering the full eval window.
+        # (H weeks before eval_start would make the forecast *end* at eval_start,
+        # leaving only a single overlapping data point.)
+        train_cutoff = eval_start - pd.Timedelta(weeks=1)
+        train_data   = df_win[pd.to_datetime(df_win[NWSS_DATE_COL]) <= train_cutoff].copy()
+
+        if train_data.empty or train_data[COUNTY_COL].nunique() < 1:
+            logger.warning(
+                "Outbreak window '{}': no training data before {}. Skipping.",
+                name, train_cutoff.date(),
+            )
+            continue
+
+        logger.info(
+            "Outbreak validation '{}' — train ≤ {}  eval {} → {}  ({} counties)",
+            name, train_cutoff.date(), eval_start.date(), eval_end.date(),
+            df_win[COUNTY_COL].nunique(),
+        )
+
+        try:
+            model = model_factory()
+            model.fit(train_data, val_size=model.h)
+            forecast_df = model.predict()
+        except Exception as exc:
+            logger.warning("Outbreak window '{}': training failed — {}. Skipping.", name, exc)
+            continue
+
+        forecast_eval = forecast_df[
+            (pd.to_datetime(forecast_df["ds"]) >= eval_start) &
+            (pd.to_datetime(forecast_df["ds"]) <= eval_end)
+        ].copy()
+        actual_eval = df_win[
+            (pd.to_datetime(df_win[NWSS_DATE_COL]) >= eval_start) &
+            (pd.to_datetime(df_win[NWSS_DATE_COL]) <= eval_end)
+        ].copy()
+
+        if forecast_eval.empty or actual_eval.empty:
+            logger.warning(
+                "Outbreak window '{}': forecast does not overlap eval period "
+                "(forecast covers {} → {}).  Skipping.",
+                name,
+                forecast_df["ds"].min().date() if not forecast_df.empty else "?",
+                forecast_df["ds"].max().date() if not forecast_df.empty else "?",
+            )
+            continue
+
+        q_cols     = QuantileColumns.auto_detect(forecast_eval)
+        eval_result = evaluate(actual_df=actual_eval, forecast_df=forecast_eval, q_cols=q_cols)
+
+        sens = eval_result.lead_time.sensitivity
+        logger.info(
+            "  → Cov95={:.1%}  WIS={:.3f}  Sensitivity={}  AUC={:.3f}",
+            eval_result.coverage_95,
+            eval_result.mean_wis,
+            f"{sens:.2f}" if not (isinstance(sens, float) and np.isnan(sens)) else "N/A",
+            eval_result.lead_time.auc,
+        )
+
+        results.append(OutbreakWindowResult(
+            name=name,
+            eval_start=win["eval_start"],
+            eval_end=win["eval_end"],
+            n_counties=df_win[COUNTY_COL].nunique(),
+            eval_result=eval_result,
+        ))
+
+    return results
+
+
+# ---------------------------------------------------------------------------
 # Expanding-window time-series cross-validation
 # ---------------------------------------------------------------------------
 
@@ -1037,6 +1160,7 @@ def expanding_window_cv(
     q_cols: Optional[QuantileColumns] = None,
     min_absolute: float = 0.1,
     date_col: str = NWSS_DATE_COL,
+    forecast_collector: Optional[list] = None,
 ) -> pd.DataFrame:
     """Expanding-window time-series cross-validation.
 
@@ -1139,6 +1263,11 @@ def expanding_window_cv(
                 # stopping is unnecessary.
                 model.fit(train, val_size=0)
                 forecast = model.predict()
+
+                if forecast_collector is not None and not forecast.empty:
+                    _fc = forecast.copy()
+                    _fc["cutoff_date"] = cutoff
+                    forecast_collector.append(_fc)
 
                 # Auto-detect column names on first fold with data
                 if q_cols is None and not forecast.empty:

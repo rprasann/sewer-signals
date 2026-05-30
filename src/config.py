@@ -99,6 +99,14 @@ BAY_AREA_COUNTIES: list[str] = list(BAY_AREA_FIPS.keys())
 # High-priority counties for outbreak surveillance (large population / dense transit)
 PRIORITY_COUNTIES: list[str] = ["6075", "6085", "6001", "6081"]  # SF, Santa Clara, Alameda, San Mateo
 
+# Counties excluded from model training and evaluation.
+# Napa and Solano joined the solid WW track too late (2 and 3 training weeks
+# respectively before the first CV cutoff) to produce a meaningful RobustScaler fit.
+# Their near-zero IQR (0.089–0.146 vs 1.3–1.7 for the 7 active counties) inflates
+# scaled feature values and corrupts the loss penalty calculations.  They are also
+# absent from the production dashboard.  BAY_AREA_FIPS is kept intact for map display.
+EXCLUDE_FIPS: list[str] = ["06055", "06095"]  # Napa, Solano
+
 
 # ---------------------------------------------------------------------------
 # Data Pipeline
@@ -229,7 +237,7 @@ PAST_COVARIATES: list[str] = [
 # suppresses the rapid growth trajectories in Folds 1–2 (BQ.1 onset) and the
 # holdout (XBB.1.5 peak).  With 0% PI coverage the priority is getting quantile
 # spread right; the biological prior can be restored once coverage is healthy.
-GROWTH_RATE_LAMBDA = 0.0            # Disabled — isolate underdispersion + monotonicity dynamics
+GROWTH_RATE_LAMBDA = 0.0            # Disabled — net negative on all metrics at λ=0.005
 MAX_DAILY_GROWTH_RATE = 0.35        # ln(2)/2 ≈ 0.347; kept for GrowthRatePenalty standalone class
 
 # Phase 4 — volatility-adjusted weekly step-change cap for the scaled forecast median.
@@ -268,8 +276,14 @@ UNDERDISPERSION_K = 0.5             # target: underdispersion penalty ≈ 50% of
 # Phase 4 — volatility-adjusted minimum PI width
 # min_width_t = MIN_PI_WIDTH_MULTIPLIER × σ(y_insample[-4:])
 # Wider during surge onsets (high σ), narrower during calm baselines (low σ).
-MIN_PI_WIDTH_MULTIPLIER = 2.0       # multiplier on per-sample insample std
-MIN_PI_WIDTH_FLOOR = 0.5            # absolute minimum width floor (scaled units)
+MIN_PI_WIDTH_MULTIPLIER = 3.0       # multiplier on per-sample insample std; at 2.0 the dynamic
+                                    # path only exceeded Phase 3's 2.5 floor when σ>1.25 (near
+                                    # peak only); at 3.0 it activates at σ>0.83 (surge onset)
+MIN_PI_WIDTH_FLOOR = 1.5            # absolute minimum width floor (scaled units); raised
+                                    # from 0.5 in Phase 5 — the 0.5 floor allowed PI collapse
+                                    # to 0.6 scaled units in calm periods (4× below Phase 3).
+                                    # Note: _dynamic_min_width now clamps to min_pi_width (2.5)
+                                    # as its primary floor; this value is the last-resort safety net.
 
 QUANTILE_LEVELS = TFT_CONFIG["quantile_levels"]
 
@@ -300,6 +314,38 @@ Z_SCORE_BASELINE_WEEKS = 8         # rolling window (weeks) for baseline mean/st
 
 LEAD_TIME_WINDOW_MIN = 7           # days before clinical confirmation
 LEAD_TIME_WINDOW_MAX = 21
+
+# Targeted historical outbreak windows for post-hoc sensitivity validation.
+# train_end is computed dynamically as eval_start − H weeks so the model's
+# H-step forecast lands inside the eval window.
+# Windows 1–3: only SF/San Mateo/Santa Clara had solid WW data that early.
+# Window 4: all 7 active counties available.
+OUTBREAK_VALIDATION_WINDOWS: list[dict] = [
+    {
+        "name":       "Winter 2020-21",
+        "eval_start": "2020-11-18",
+        "eval_end":   "2021-01-20",
+        "counties":   ["06075", "06081", "06085"],
+    },
+    {
+        "name":       "Delta 2021",
+        "eval_start": "2021-07-28",
+        "eval_end":   "2021-09-22",
+        "counties":   ["06075", "06081", "06085"],
+    },
+    {
+        "name":       "Omicron BA.1",
+        "eval_start": "2021-12-15",
+        "eval_end":   "2022-02-23",
+        "counties":   ["06075", "06081", "06085"],
+    },
+    {
+        "name":       "XBB.1.5 Onset",
+        "eval_start": "2022-12-14",
+        "eval_end":   "2023-01-25",
+        "counties":   None,
+    },
+]
 
 
 # ---------------------------------------------------------------------------

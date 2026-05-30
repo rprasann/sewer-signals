@@ -1,0 +1,9 @@
+**Weekly Surveillance Bulletin: COVID-19 Forecast Summary**
+
+The current COVID-19 case trajectory across the nine-county San Francisco Bay Area is upward, with all forecasted counties showing an increase in weekly new cases over the next month. This indicates a growing regional surge. Alameda and Santa Clara counties are projected to experience the highest volume of new cases, while San Francisco shows a particularly sharp relative increase in its forecast.
+
+The "prediction interval" provided in this report represents the range of possible outcomes. A wide interval, such as those seen in Alameda or Santa Clara, indicates higher uncertainty; while we expect cases to rise, the exact number could fluctuate significantly within that range. A narrower interval, like those in Marin or Sonoma, suggests a more predictable trend. For decision-makers, wide intervals necessitate flexible resource planning to ensure we can respond to a range of possible surge intensities, whereas narrower intervals allow for more precise logistical scheduling.
+
+A key component of this surveillance is the "lead-time" metric. This measures the head start provided by wastewater monitoring; a positive lead time means the virus is being detected in sewage before it manifests as clinical cases in clinics and hospitals. This window of time is critical for public health readiness, as it allows officials to prepare healthcare staffing and supplies before the surge reaches the clinical setting.
+
+Regarding the specific drivers of these trends, the model's variable importance data is not available in this reporting period. However, because these forecasts are built on wastewater concentration signals, the current trends suggest that changes in community-level viral shedding are the primary indicators driving our regional outlook. We will continue to monitor these signals to refine our predictive accuracy and readiness.

@@ -70,6 +70,8 @@ Usage
 
 from __future__ import annotations
 
+import math
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -79,6 +81,7 @@ import torch
 from loguru import logger
 from neuralforecast import NeuralForecast
 from neuralforecast.models import TFT
+from pytorch_lightning.callbacks import Callback
 
 from src.config import (
     BAY_AREA_FIPS,
@@ -130,6 +133,8 @@ HIST_COVARIATES: list[str] = [
     "log1p_concentration_4w_ma",      # 4-week rolling mean (medium baseline)
     "log1p_concentration_2w_std",     # 2-week rolling std (local volatility signal)
     "log1p_concentration_4w_std",     # 4-week rolling std (medium volatility signal)
+    # Phase-shift gravity — velocity divergence, no level anchor (Phase 5)
+    "ww_momentum_lead",               # vel_concentration[t] − (cases[t-1] − cases[t-2])
 ]
 
 #: One row per unique_id — derived at fit time
@@ -190,6 +195,67 @@ def build_future_df(
                 "week_of_year": int(ds.isocalendar()[1]),
             })
     return pd.DataFrame(rows)
+
+
+# ---------------------------------------------------------------------------
+# Training progress callback
+# ---------------------------------------------------------------------------
+
+class StepProgressCallback(Callback):
+    """Logs step-based training progress every N steps.
+
+    NeuralForecast trains with ``max_steps`` (gradient steps), but PyTorch
+    Lightning's default progress bar shows ``Epoch N/-2`` with no percentage
+    because it doesn't know the total when ``max_steps`` is set instead of
+    ``max_epochs``.  This callback fires on every training batch and logs a
+    clean progress line every ``log_every_n_steps`` gradient steps:
+
+        Step  100/2000 ( 5.0%)  train_loss=0.2341  valid_loss=0.6830  ETA 28.5min
+
+    Automatically disabled for CV / outbreak-validation models (those set
+    ``enable_progress_bar=False`` in ``trainer_kwargs``, which prevents this
+    callback from being added by ``WastewaterTFT``).
+    """
+
+    def __init__(self, max_steps: int, log_every_n_steps: int = 100) -> None:
+        self.max_steps         = max_steps
+        self.log_every_n_steps = log_every_n_steps
+        self._t0: float | None = None
+        self._last_valid: float = float("nan")
+
+    def on_train_start(self, trainer, pl_module) -> None:
+        self._t0 = time.time()
+        logger.info("Training started — {} steps total.", self.max_steps)
+
+    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx) -> None:
+        step = trainer.global_step
+        if step == 0 or step % self.log_every_n_steps != 0:
+            return
+
+        m          = trainer.callback_metrics
+        train_loss = float(m.get("train_loss_step", m.get("train_loss", float("nan"))))
+        valid_loss = float(m.get("valid_loss", self._last_valid))
+        if not math.isnan(valid_loss):
+            self._last_valid = valid_loss
+
+        pct     = min(step / self.max_steps * 100, 100.0)
+        elapsed = time.time() - (self._t0 or time.time())
+        eta_m   = elapsed / step * (self.max_steps - step) / 60 if step > 0 else 0.0
+
+        tl = f"{train_loss:.4f}" if not math.isnan(train_loss) else "—"
+        vl = f"{valid_loss:.4f}" if not math.isnan(valid_loss) else "—"
+        logger.info(
+            "Step {:4d}/{} ({:5.1f}%)  train_loss={}  valid_loss={}  ETA {:.1f}min",
+            step, self.max_steps, pct, tl, vl, eta_m,
+        )
+
+    def on_train_end(self, trainer, pl_module) -> None:
+        if self._t0:
+            logger.info(
+                "Training complete — {} steps in {:.1f}min.",
+                trainer.global_step,
+                (time.time() - self._t0) / 60,
+            )
 
 
 # ---------------------------------------------------------------------------

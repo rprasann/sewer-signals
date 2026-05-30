@@ -97,7 +97,7 @@ def snapshot_run(
     # Copy artefacts
     _ARTEFACTS = [
         "train.parquet", "val.parquet", "test.parquet",
-        "forecast.parquet", "cv_results.csv",
+        "forecast.parquet", "rolling_forecast.parquet", "cv_results.csv",
         "eval_summary.json", "scalers.joblib",
         "public_health_summary.txt",
     ]
@@ -161,10 +161,11 @@ def list_runs(runs_dir: Path | None = None) -> list[RunMeta]:
     return out
 
 
-def load_run_data(run_dir: Path) -> tuple[pd.DataFrame, pd.DataFrame, object, pd.DataFrame, dict]:
-    """Load (processed_df, forecast_df, q_cols, cv_df, eval_dict) from a run directory.
+def load_run_data(run_dir: Path) -> tuple[pd.DataFrame, pd.DataFrame, object, pd.DataFrame, dict, pd.DataFrame]:
+    """Load (processed_df, forecast_df, q_cols, cv_df, eval_dict, rolling_forecast_df) from a run directory.
 
     processed_df is train + val + test concatenated — the full historical timeline.
+    rolling_forecast_df is the stitched 28-week rolling holdout forecast (empty when not available).
     All DataFrames are already in unscaled log1p space (as exported by main.py).
     """
     from src.evaluation.metrics import QuantileColumns
@@ -201,4 +202,8 @@ def load_run_data(run_dir: Path) -> tuple[pd.DataFrame, pd.DataFrame, object, pd
     eval_path = run_dir / "eval_summary.json"
     eval_dict = json.loads(eval_path.read_text()) if eval_path.exists() else {}
 
-    return processed_df, forecast_df, q_cols, cv_df, eval_dict
+    # Rolling holdout forecast (optional — only present when --rolling-holdout was used)
+    rolling_path = run_dir / "rolling_forecast.parquet"
+    rolling_forecast_df = pd.read_parquet(rolling_path) if rolling_path.exists() else pd.DataFrame()
+
+    return processed_df, forecast_df, q_cols, cv_df, eval_dict, rolling_forecast_df
