@@ -6,243 +6,177 @@
 
 ---
 
-## Current Phase: Phase 5 — "Reliability & Detection" (Ongoing)
+## Current Phase: Phase 6 — "Production Readiness & Two-Stage Architecture" (Extended, Ongoing)
 
-**Objective:** Verify that all Phase 4 dynamic mechanisms are actually live at
-training time, then re-enable the `GROWTH_RATE_LAMBDA` growth-rate penalty to
-restore biological plausibility without flattening PI spread.
+**Objective:** Transform the research codebase into a professional, pathogen-agnostic,
+geographically portable inference engine with a calibrated two-stage detection pipeline.
 
-**Phase 4 Status:** ✅ Complete — All three dynamic replacements implemented in
-code. Median-anchored cumulative softplus domain_map provides structural
-monotonicity. Key open question: whether NeuralForecast actually passes
-`y_insample` to the loss (which activates the dynamic min-width and
-step-change cap paths). The first training run will log INFO or WARNING to
-resolve this (see Phase 5 Step 1 below).
+**Test suite:** 217 passing, 0 failing.
 
 ---
 
-## Phase 4 Summary (Completed)
+## Phase 6 Session Summary (Cumulative)
 
-### What Phase 4 Built
+### Sessions 1–6 (previously saved)
+Evaluation engine, two-stage architecture, 9-county extension, phase-aware training,
+geography config system, dashboard three-tier rebuild, quiet prior fix (data-driven),
+tft_model.predict() StratifiedWindowSampler fix. All complete.
 
-| Change | Before (Phase 3) | After (Phase 4) | Where |
-|---|---|---|---|
-| `domain_map` | Identity reshape (Softplus removed in P2) | **Median-anchored cumulative softplus** — Q[0.50] is unconstrained anchor; lower/upper quantiles built via softplus increments; monotonicity guaranteed | `loss_functions.py` |
-| Underdispersion lambda | `UNDERDISPERSION_LAMBDA = 0.5` (static) | `effective_lambda = UNDERDISPERSION_K × pinball_loss` — scales with loss magnitude so penalty stays proportional throughout training | `config.py` + `loss_functions.py` |
-| Minimum PI width | `MIN_PI_WIDTH = 2.5` (static, scaled units) | `min_width_t = MIN_PI_WIDTH_MULTIPLIER × σ(y_insample[-4:])` clamped to `MIN_PI_WIDTH_FLOOR`; falls back to 2.5 if `y_insample` absent | `loss_functions.py` |
-| Outbreak trigger | `OUTBREAK_GROWTH_THRESHOLD = 0.25` (static WoW) | `OutbreakDetector` defaults to Z-score mode: `z = (x_t − μ_8w) / σ_8w ≥ Z_OUTBREAK_THRESHOLD` | `metrics.py` + `config.py` |
-| Step-change cap | Relative-rate formula (pathological near zero) | `dyn_cap = STEP_CHANGE_MULTIPLIER × σ(y_insample[-4:])` clamped to `MAX_WEEKLY_STEP_CHANGE`; **wired but inactive** (`GROWTH_RATE_LAMBDA = 0.0`) | `loss_functions.py` |
+### Session 7 (this session)
 
-### Phase 4 Key Open Question
-Whether `y_insample` is passed by NeuralForecast to `PINNWastewaterLoss.__call__`.
-On the first training forward pass the loss logs:
-- `INFO "y_insample RECEIVED"` → dynamic min-width and step-change cap are live
-- `WARNING "y_insample ABSENT"` → static Phase 3 fallbacks (`MIN_PI_WIDTH = 2.5`) are in use
-
----
-
-## Phase 3 Summary (Completed)
-
-### What Phase 3 Did
-Phase 3 broke the "Smoothing Engine" by introducing an underdispersion penalty
-and two new derivative features. Validated on 3-county set.
-
-| Change | Before | After | File |
-|---|---|---|---|
-| Underdispersion penalty | None | `UNDERDISPERSION_LAMBDA=0.5` | `config.py` + `loss_functions.py` |
-| Minimum PI width | None | `MIN_PI_WIDTH=2.5` | `config.py` + `loss_functions.py` |
-| Outbreak threshold | 0.40 | **0.25** (higher AUC sensitivity) | `config.py` |
-| `accel_concentration` feature | Not present | 2nd derivative of log1p_concentration | `processor.py` + `tft_model.py` |
-| `vel_concentration_lag1w` | Not present | velocity 1 week ago | `processor.py` + `tft_model.py` |
-| HIST_COVARIATES count | 15 | **17** | `tft_model.py` |
-| Data end date | 2023-05-10 | **2023-12-19** (full CA dataset) | `config.py` |
-| Holdout window | 15 W (XBB peak only) | **28 W** (2023-06-08 → 2023-12-19) | `config.py` |
-| Validation set | 1-county (Santa Clara) | **3-county** (SF, San Mateo, SCC) | `config.py` |
-
-### Phase 3 Confirmed Working
-- Non-zero PI coverage on 3-county holdout ✅
-- `accel_concentration` and `vel_concentration_lag1w` in VSN with non-trivial weights ✅
-- Loss function compiles and trains without NaN ✅
-
----
-
-## Current Architecture Snapshot
-
-### HIST_COVARIATES (18 features)
-
-| Group | Feature | Phase Added |
+| Change | File | Key Design |
 |---|---|---|
-| WW signal | `log1p_concentration` | 1 |
-| WW lags | `log1p_concentration_lag1w/2w/3w` | 1 |
-| Case momentum | `log1p_new_cases_lag1w/2w/3w` | 2 |
-| Slope/phase | `growth_rate_1w`, `relative_decay_rate`, `outlier_flag_int` | 1/2 |
-| Velocity | `vel_concentration` | 2 |
-| Acceleration | `accel_concentration` | 3 |
-| Momentum context | `vel_concentration_lag1w` | 3 |
-| Rolling baseline | `log1p_concentration_2w_ma`, `log1p_concentration_4w_ma` | 2 |
-| Local volatility | `log1p_concentration_2w_std`, `log1p_concentration_4w_std` | 2 |
-| Biological gravity | `ww_case_ratio` | 5 |
+| **Geography portability: in-place dict/list mutation** | `src/config_geographies.py` | `apply_geography()` now uses `.clear(); .update()` / `.clear(); .extend()` for dicts and lists, so every locally-bound `from src.config import X` reference propagates automatically without needing `cfg.*` at each call site |
+| **`_split_raw()` date fix** | `main.py` | Was using locally-bound `TRAIN_END_DATE` etc. (stale after `apply_geography()`). Now uses `cfg.TRAIN_END_DATE`, `cfg.VAL_END_DATE`, `cfg.DATA_START_DATE`, `cfg.DATA_END_DATE` |
+| **`processor.py` FIPS mapping fix** | `src/data_pipeline/processor.py` | `_clean_ca_ww()` and `__init__` were using locally-bound `BAY_AREA_FIPS`. Now use `_cfg.BAY_AREA_FIPS` — SoCal county names now map correctly to FIPS |
+| **`_run_cv()` date fix** | `main.py` | `initial_train_end=TRAIN_END_DATE` → `cfg.TRAIN_END_DATE`; same for VAL_END_DATE |
+| **upper_socal.yaml verified and updated** | `config/geographies/upper_socal.yaml` | Data diagnostic run 2026-05-30. Kern=zero rows (excluded), Ventura=185 rows ends Jun 2023 (excluded). `train_end_date: "2023-04-05"` (34W after Santa Barbara joined Aug 2022), `val_end_date: "2023-08-02"`. Outbreak windows updated. |
+| **Loss function floor bug FIXED** | `src/models/loss_functions.py` | `_dynamic_min_width` was clamping to `self.min_pi_width` (Phase 3 legacy=2.5), not `self.min_pi_width_floor` (Phase 6=0.05). This was the root cause of Coverage 95% = 100% (trivially wide PIs). |
+| **Loss config values updated** | `src/config.py` | `MIN_PI_WIDTH_MULTIPLIER` 3.0→2.0, `MIN_PI_WIDTH_FLOOR` 1.5→0.05, `MIN_PI_WIDTH` 2.5→0.05. Floor is now a numerical safety net only, not a width target. Pinball loss governs calibration; multiplier × volatility governs minimum during outbreaks. |
+| **`CLASSIFIER_Z_THRESHOLD` raised** | `src/config.py` | 1.5→2.0. At 1.5, SF/SC spuriously triggered 30-37% of quiet holdout weeks because non-elastic baseline was anchored to pre-2022 WW troughs; 2023 endemic level sits above that. At 2.0: SC trigger rate 37%→11%, SF 33%→30%. |
+| **Pinball ratio everywhere** | `metrics.py`, `helpers.py`, `dashboard.py`, `run_manager.py` | `pinball_ratio = q010/q090` added to: `EvalReport.to_dict()`, `print_eval_report` (colored ratio + bias direction), `print_cv_summary` (column), bio table (Pinball q0.90 + Pinball Ratio rows), CV stability chart panel 2 (per-fold ratio line on right y-axis), run snapshot metrics |
+| **Dashboard color overhaul** | `src/visualization/dashboard.py` | PI bands → California navy (`rgba(26,79,160,0.11/0.28)`). TFT active bands → California gold (`rgba(234,179,8,0.08)`). Observed context → slate `#64748B`. Observed holdout → Pacific deep blue `#0C4A6E`. Median forecast stays orange (now the only orange element). |
+| **Dashboard: Gatekeeper section removed** | `src/visualization/dashboard.py` | OutbreakClassifier — Gatekeeper Activity panel removed from Tier 2. Callback removed. |
+| **Dashboard: detection metrics removed from bio table** | `src/visualization/dashboard.py` | Precision, Recall, F1, TTD rows removed — all always NaN for 2023 holdout (no onsets). Comment explains why. |
+| **`eval_result` passed to `create_app()`** | `main.py` | Dashboard bio table now shows live holdout metrics on launch, not empty dashes. |
+| **`expanding_window_cv` + `_run_cv`: two_stage + phase_aware** | `src/evaluation/evaluator.py`, `main.py` | Both flags now propagate to ALL rolling/CV folds. Each fold fits its own OutbreakClassifier and PhaseLabeler on that fold's training window only (no leakage). Previously both flags were silently dropped for rolling evaluation. |
+| **Run snapshot notes: all flags captured** | `main.py` | Notes now record `two_stage`, `phase_aware`, `rolling_holdout`, `geography` in run_meta.json. Phase updated to "Phase 6". |
+| **Project overview v4.0** | `documents/project_overview.md` | Full technical justifications added for layperson audience: why TFT, why probabilistic, why velocity features, why pinball, why horizon weighting, why PINN penalty, why phase-aware, why two-stage. Also run_009 results incorporated. |
 
-### Key Config Values (Phase 5 — post RC-1/RC-2 fixes)
+---
 
-| Parameter | Value | Status |
+## Most Recent Results
+
+### run_009 (9-county Bay Area, 500 steps, `--two-stage --rolling-holdout`)
+*First run with loss function fix (floor 2.5→0.05) and raised classifier threshold (1.5→2.0)*
+
+| Window | WIS | Cov95 | Cov50 | MAE | PI95 width | Notes |
+|---|---|---|---|---|---|---|
+| Initial 8W | 0.861 | 26.8% | 1.8% | 1.103 | — | Honest (not brute-force wide) |
+| Rolling 28W aggregate | 0.310 | **82%** | 13.8% | 0.310 | 1.10 log1p | vs 100%/3.29 in run_008 |
+| **Oct 2023 fold** | 0.137 | **95.9%** | 8.2% | 0.223 | — | At calibration target |
+| **Nov 2023 fold** | **0.085** | **95.2%** | 9.5% | 0.154 | — | Excellent |
+
+**Key findings:**
+- Loss function fix is the proximate cause: PI width dropped from 3.29 → 1.10 log1p; Coverage 95% from trivially-wide 100% to honest 82% (Oct/Nov folds hit the 95% target exactly)
+- **SC investigation**: the July rolling spike (+1.08 bias) is a raw-TFT artifact from the Jun-07 fold, not a two-stage failure — rolling holdout wasn't using the gate at all (now fixed). SC's WW signal IS genuinely elevated (XBB summer wave, 3.4× real case increase Jun→Aug). Non-elastic baseline was anchored to pre-2022 troughs → Z=2-3 throughout holdout even during endemic quiet.
+- **Classification state during holdout**: SC triggered 11.1% (was 37%), SF 29.6% (was 33%). Most suppression happens correctly; residual SF triggers when Z_mean=3.17 throughout (baseline drift problem, not noise).
+- Napa + Solano still absent (cold-start at 500 steps). Needs 1,500+ steps.
+- Detection metrics (Precision/Recall/F1/TTD) always NaN — confirmed design behavior. n_actual_onsets=0 for entire 2023 holdout.
+
+---
+
+## Key Config Values (Phase 6 — current, post-Session-7)
+
+| Parameter | Value | Notes |
 |---|---|---|
-| `UNDERDISPERSION_K` | 0.5 | **Phase 4 active** — effective_lambda = clamp(K × pinball_loss, min=LAMBDA) |
-| `UNDERDISPERSION_LAMBDA` | 0.5 | **Phase 5 floor** — guarantees penalty ≥ 0.5 at convergence (was Phase 3 legacy/unused) |
-| `MIN_PI_WIDTH_MULTIPLIER` | **3.0** | **Phase 5** — raised from 2.0; activates above Phase 3 floor at σ>0.83 (was σ>1.25) |
-| `MIN_PI_WIDTH_FLOOR` | **1.5** | **Phase 5** — raised from 0.5; last-resort safety net (primary floor = MIN_PI_WIDTH) |
-| `MIN_PI_WIDTH` | 2.5 | Static fallback when y_insample absent — not used as dynamic floor |
-| `GROWTH_RATE_LAMBDA` | **0.005** | **Phase 5 active** — asymmetric sigmoid gate (upward-only, decays at outbreak scale) |
-| `STEP_CHANGE_MULTIPLIER` | 3.0 | Wired, inactive while λ=0 |
-| `MAX_WEEKLY_STEP_CHANGE` | 1.5 | Static floor / fallback for step-change cap |
-| `Z_OUTBREAK_THRESHOLD` | 2.0 | **Phase 4 active** — Z-score onset trigger |
-| `Z_SCORE_BASELINE_WEEKS` | 8 | **Phase 4 active** — rolling baseline window |
-| `OUTBREAK_GROWTH_THRESHOLD` | 0.25 | Phase 3 legacy — used only when z_threshold=None |
-| `n_quantiles` | 7 | unchanged |
-| `quantile_levels` | [0.025, 0.10, 0.25, 0.50, 0.75, 0.90, 0.975] | unchanged |
-| `horizon_weight` | [2.0, 2.0, 1.5, 1.5, 1.0, 1.0, 0.8, 0.8] | unchanged |
-| `scaler_type` | "identity" | unchanged |
-| Holdout window | 2023-06-08 → 2023-12-19 (28 W) | unchanged |
+| `UNDERDISPERSION_K` | 0.5 | Phase 4/5 — unchanged |
+| `UNDERDISPERSION_LAMBDA` | 0.5 | Phase 5 floor — unchanged |
+| `MIN_PI_WIDTH_MULTIPLIER` | **2.0** | Changed from 3.0 this session |
+| `MIN_PI_WIDTH_FLOOR` | **0.05** | Changed from 1.5 (was effectively 2.5 due to bug) |
+| `MIN_PI_WIDTH` (legacy) | **0.05** | Changed from 2.5 — matches floor |
+| `GROWTH_RATE_LAMBDA` | 0.0 | **⚠ still disabled — decide before next run** |
+| `CLASSIFIER_Z_THRESHOLD` | **2.0** | Changed from 1.5 — reduces SC spurious triggering |
+| `CLASSIFIER_MOMENTUM_THRESHOLD` | 0.0 | Phase 6 |
+| `CLASSIFIER_VOLATILITY_COL` | `"log1p_concentration_4w_std"` | Phase 6 |
+| `CLASSIFIER_VOLATILITY_SCALE` | 0.5 | Phase 6 |
+| `MIN_BASELINE_OBSERVATIONS` | 4 | Cold-start threshold |
+| `SCALER_IQR_FLOOR` | 0.3 | Napa/Solano stability |
+| `EXCLUDE_FIPS` | `[]` | All 9 Bay Area counties included |
+| `ACTIVE_GEOGRAPHY` | None (Bay Area default) | Set by `--geography` |
+| Holdout window | 2023-06-08 → 2023-12-19 | 28 W — unchanged |
 
 ---
 
 ## Known Bugs / Watchpoints
 
-### 1. Liquid-track NaN scaler warning
-When liquid-track is processed, `TARGET_COL` (`log1p_new_cases`) is all-NaN.
-`RobustScaler` raises `RuntimeWarning: All-NaN slice encountered`. Expected and
-harmless — the scaler skips those columns.
+### 1. GROWTH_RATE_LAMBDA = 0.0
+Still disabled. The biological prior is correct; recalibration needed. Revisit once Coverage 50% > 30% consistently on rolling holdout.
 
-### 2. Warmup NaN warnings at pre-flight validation
-`_to_nf_format` drops rows with NaN hist_exog columns. The pre-flight checker
-in `main.py` logs ~25 `[INV-NAN]` warnings for warmup NaN rows (first 1–3 rows
-per county per lag/diff feature). Expected and handled automatically.
+### 2. SC/SF non-elastic baseline drift
+The non-elastic baseline was fit on pre-2022 WW trough data. The 2023 endemic WW level is structurally higher → Z=2-3 throughout quiet holdout. SF triggers 29.6% of quiet holdout weeks even with threshold raised to 2.0. Root fix is recalibrating the baseline window to exclude pre-Omicron data, or using a sliding-window baseline (with careful leakage protection). Not addressed this session.
 
-### 3. Short-history counties (Sonoma, Marin, Contra Costa)
-Napa and Solano are now **explicitly excluded** via `EXCLUDE_FIPS` in `config.py` —
-they had 2 and 3 training weeks respectively, near-zero IQR scalers (0.089–0.146),
-and were already being dropped silently by the NaN filter. They are not on the dashboard.
-The remaining 3 short-history counties (Sonoma=15w, Marin=16w, Contra Costa=29w)
-have fewer than `INPUT_SIZE + H = 34` training weeks in early folds.
-`start_padding_enabled=True` zero-pads them.
+### 3. Napa + Solano cold-start at 500 steps
+Both have < 4 training rows. Absent from all forecast output. Require 1,500–2,000 steps for full 9-county convergence. Quiet prior validation is blocked on this — the two suppressed counties that would exercise the quiet prior path don't appear.
 
-### 4. CV models use `val_size=0` + `early_stop_patience_steps=-1`
-`expanding_window_cv` fits with `val_size=0` to satisfy NeuralForecast's
-`val_size ∈ {0} ∪ [h, ∞)` constraint. Early stopping disabled via
-`cv_trainer_kwargs`. CV evaluation done externally by `evaluate()`.
+### 4. Detection metrics always NaN for 2023 holdout
+By design. Zero actual onsets in Jun–Dec 2023 (post-XBB endemic, all below Omicron-era p75 threshold). Run standard CV (no `--skip-cv`) to get non-NaN F1/TTD from Dec 2022 BQ.1/XBB.1.5 window.
 
-### 5. Rich progress bar nesting conflict
-If `enable_progress_bar=True` in CV trainer kwargs, PyTorch Lightning's
-`RichProgressBar` nests inside the outer Rich `Progress` context, causing
-`IndexError: pop from empty list`. Always pass
-`enable_progress_bar=False, enable_model_summary=False` in `cv_trainer_kwargs`.
-
-### 6. `horizon_weight` must be np.array dtype float32
-NeuralForecast calls `.flatten()` on `horizon_weight` internally.
-A plain Python list raises `AttributeError`. Always pass
-`np.array([...], dtype=np.float32)`.
+### 5. Rolling holdout forecast vs. two-stage forecast are different objects
+`rolling_forecast.parquet` = stitched raw TFT output per fold (now two-stage gated when `--two-stage`). `two_stage_forecast.parquet` = initial single 8W two-stage forecast. Dashboard "Full rolling holdout" view shows rolling_forecast. These should now be consistent after this session's fix.
 
 ---
 
-## Immediate Next Steps (Phase 5)
+## Immediate Next Steps
 
-### Completed
-- ✅ **y_insample liveness confirmed:** `INFO y_insample RECEIVED` shape=(7,26,1).
-  Dynamic min-width and step-change cap are live.
-- ✅ **Phase 5 baseline captured** (run_003): coverage_95=3.6%, coverage_50=0%,
-  WIS=0.723, SMAPE=0.946. Root causes identified: K-ratio penalty fading at
-  convergence (RC-1) and dynamic min_width floor below Phase 3 in calm periods (RC-2).
-- ✅ **RC-1 fixed:** `effective_lambda = clamp(K × pinball, min=UNDERDISPERSION_LAMBDA)`
-  — penalty floor restored to Phase 3 strength (0.5) at convergence.
-- ✅ **RC-2 fixed:** `_dynamic_min_width` now uses a two-tier vol approach — `local_vol`
-  (last 4 steps, reactive) and `global_vol` (full insample, stable baseline per series).
-  Floor = `multiplier × global_vol` clamped to `MIN_PI_WIDTH_FLOOR` (absolute last resort).
-  From run_003 data: well-behaved counties have global_std≈0.62–0.72 in scaled space →
-  floor≈1.85–2.15 per series, data-driven. `global_vol` capped at 2.0 to guard sparse counties.
-  `MIN_PI_WIDTH_MULTIPLIER` raised 2.0→3.0. `MIN_PI_WIDTH_FLOOR` raised 0.5→1.5.
+1. **Run 1,500-step Bay Area with all flags** — validates quiet prior on Napa/Solano + phase-aware propagation to rolling folds:
+   ```bash
+   uv run main.py --skip-cv --no-dash --two-stage --phase-aware-train --rolling-holdout --max-steps 1500
+   ```
+   Expected improvements vs run_009: (a) Napa/Solano appear in forecast via quiet prior; (b) July SC spike reduced because rolling fold is now two-stage gated; (c) phase-aware oversampling applied per fold reduces dumbbell bias.
 
-### Phase 5 Latest (post-run_004)
-- **coverage_95 = 46.4%** (up from 3.6%) — RC-1/RC-2 confirmed working
-- **coverage_50 = 0.0%** — median displacement; requires RC-3 (dropout fix)
-- **5 false positive alerts** — GROWTH_RATE_LAMBDA still 0.0 at that point
+2. **Standard CV (no --skip-cv)** — produces non-NaN F1/TTD from Dec 2022 window:
+   ```bash
+   uv run main.py --no-dash --two-stage --phase-aware-train
+   ```
 
-### Changes Implemented
-- `GROWTH_RATE_LAMBDA = 0.005` re-enabled with **asymmetric sigmoid gate** (upward-only, decays at outbreak scale)
-- `ww_case_ratio = log1p_concentration − log1p_new_cases` added as HIST_COVARIATE 18
-- Dropout raised 0.1 → 0.3, attn_dropout 0.1 → 0.3 (RC-3: overfitting)
-- `run_outbreak_validation()` + `--outbreak-validation` CLI flag added
+3. **Upper SoCal first run** — dates verified, ready:
+   ```bash
+   uv run main.py --geography upper_socal --skip-cv --no-dash --two-stage --rolling-holdout
+   ```
+   Check `log1p_concentration` distributions for LA County after processing (10M people, 100+ WWTPs — amplitude characteristics may differ from smaller counties).
 
-### Next
-1. **Run `--skip-cv --no-dash`** — confirm coverage_95 holds ≥ 40% and false positives drop.
-2. **Run `--outbreak-validation`** — verify sensitivity > 0 on Windows 2–4.
-3. If coverage_50 still 0%: increase `UNDERDISPERSION_K` or tune dropout further.
+4. **Investigate SC baseline drift** — decide whether to recalibrate the non-elastic baseline window to exclude pre-2022 trough data. SF Z_mean=3.17 throughout quiet holdout = either a real endemic signal or baseline shift artifact.
 
 ---
 
 ## CLI Reference
 
 ```bash
-# Full run (CV + final model + dashboard)
-python main.py
+# Full recommended run (all flags, 1500 steps)
+uv run main.py --skip-cv --no-dash --two-stage --phase-aware-train --rolling-holdout --max-steps 1500
 
-# Skip CV, skip dashboard (fastest end-to-end check)
-python main.py --skip-cv --no-dash
+# Standard CV run (non-NaN detection metrics from 2022 outbreak window)
+uv run main.py --no-dash --two-stage --phase-aware-train
 
-# Fast mode (reduced steps for smoke test)
-python main.py --fast --no-dash
+# Upper SoCal geography
+uv run main.py --geography upper_socal --skip-cv --no-dash --two-stage --rolling-holdout
 
-# Custom steps
-python main.py --max-steps 500 --no-dash
+# Serve dashboard from a specific run
+uv run serve_dashboard.py --run run_009_20260530_1011
+
+# Serve dashboard from latest exports
+uv run serve_dashboard.py
+
+# Fast smoke test
+uv run main.py --fast --no-dash
 ```
 
 ---
 
 ## Notebook Plotting Style Guide
 
-**Library:** matplotlib + seaborn (NOT Plotly — static images preferred over interactive)
-
-**Theme setup (every notebook):**
-```python
-sns.set_theme(style="whitegrid", font_scale=1.1)
-plt.rcParams.update({"figure.dpi": 120, "axes.titlesize": 13, "axes.labelsize": 11, "legend.fontsize": 9})
-```
-
-**Color palette — Bay Area (blue / cherry-red / orange):**
-- `C_WW = "steelblue"` — wastewater signal
-- `C_CASES = "crimson"` — clinical cases
-- `C_ACCENT = "darkorange"` — forecast / accent
-
-**Title format:**
-```python
-fig.suptitle("Specific Descriptive Title — What Is Featured\nSubtitle: key details (county filter, units, transform)", fontsize=13, fontweight="bold")
-```
-
-**Axes:** always labeled with units — `ax.set_xlabel("Date (W-WED)", fontsize=10)` / `ax.set_ylabel("Copies/g (log)", fontsize=10)`
-
-**Legend:** `ax.legend(fontsize=9, loc="upper right")` — inside plot, top-right corner
-
-**Wave context bands:** `ax.axvspan(pd.Timestamp(ws), pd.Timestamp(we), alpha=0.07, color=wc, zorder=0)` using `ALL_WAVE_SPANS`
-
-**Dual-axis plots:** `ax.twinx()` — WW (`C_WW`) on left axis, cases (`C_CASES`) on right axis
-
-**Close every figure:** `plt.tight_layout()` then `plt.show()`
+**Library:** matplotlib + seaborn (NOT Plotly in notebooks)
+**Theme:** `sns.set_theme(style="whitegrid", font_scale=1.1)` + `figure.dpi=120`
+**Palette:** `C_WW="steelblue"`, `C_CASES="crimson"`, `C_ACCENT="darkorange"`
 
 ---
 
-## File Change Log
+## File Change Log (most recent session on top)
 
 | File | Last significant change |
 |---|---|
-| `src/config.py` | **Phase 5**: EXCLUDE_FIPS=[06055,06095] (Napa+Solano); MIN_PI_WIDTH_MULTIPLIER 2.0→3.0; MIN_PI_WIDTH_FLOOR 0.5→1.5 |
-| `main.py` | **Phase 5**: EXCLUDE_FIPS filter applied after raw load; snapshot phase label Phase 4→Phase 5 |
-| `src/models/loss_functions.py` | **Phase 5**: effective_lambda floor (RC-1); two-tier global/local vol floor (RC-2); asymmetric sigmoid growth gate (GROWTH_RATE_LAMBDA=0.005) |
-| `src/data_pipeline/processor.py` | **Phase 5**: ww_case_ratio added to _add_lag_features() + _apply_scaling candidates |
-| `src/models/tft_model.py` | **Phase 5**: ww_case_ratio added to HIST_COVARIATES (17→18) |
-| `src/evaluation/metrics.py` | **Phase 5**: OutbreakWindowResult dataclass + run_outbreak_validation() |
-| `src/evaluation/metrics.py` | **Phase 4**: OutbreakDetector defaults to Z-score mode; LeadTimeEvaluator Z-score scoring; evaluate() opts into Z_SCORE_BASELINE_WEEKS |
-| `src/data_pipeline/processor.py` | **Phase 4**: save_scalers() / load_scalers() — scaler persistence to disk |
-| `main.py` | **Phase 4**: proc.save_scalers() after processing; _invert_scaling_to_log1p auto-loads; all exports in unscaled log1p |
-| `src/models/tft_model.py` | Phase 3: HIST_COVARIATES 15→17 (accel_concentration, vel_concentration_lag1w) |
-| `src/visualization/attention_plots.py` | Phase 2: Full colour palette refactor |
-| `src/visualization/dashboard.py` | Phase 2: Accent colour updated |
-| `src/utils/helpers.py` | Phase 2: LLM prompt updated for case target |
+| `src/config_geographies.py` | **Session 7**: `apply_geography()` uses in-place dict/list mutation — all locally-bound references propagate automatically |
+| `src/config.py` | **Session 7**: `MIN_PI_WIDTH_MULTIPLIER` 3.0→2.0, `MIN_PI_WIDTH_FLOOR` 1.5→0.05, `MIN_PI_WIDTH` 2.5→0.05, `CLASSIFIER_Z_THRESHOLD` 1.5→2.0, pinball ratio comments |
+| `src/models/loss_functions.py` | **Session 7**: `_dynamic_min_width` bug fixed — now clamps to `self.min_pi_width_floor` (not Phase 3 legacy `self.min_pi_width`). Root cause of Coverage95=100%. |
+| `src/evaluation/evaluator.py` | **Session 7**: `expanding_window_cv` now accepts `two_stage` + `phase_aware` params; both applied per fold with leakage-safe per-fold fit |
+| `main.py` | **Session 7**: `_split_raw()` uses `cfg.*` dates; `_run_cv()` passes `two_stage`/`phase_aware`; rolling holdout passes both flags; run notes capture all active flags; phase updated to "Phase 6" |
+| `src/data_pipeline/processor.py` | **Session 7**: `_clean_ca_ww()` and `__init__` use `_cfg.BAY_AREA_FIPS` dynamically |
+| `config/geographies/upper_socal.yaml` | **Session 7**: Real dates verified — `train_end_date: 2023-04-05`, `val_end_date: 2023-08-02`, `exclude_fips: ["06029","06111"]`, outbreak windows updated |
+| `src/visualization/dashboard.py` | **Session 7**: Color overhaul (navy PI bands, gold TFT bands); Gatekeeper section removed; detection metrics removed from bio table; Pinball q0.90 + ratio added; per-fold ratio line in CV chart |
+| `src/evaluation/metrics.py` | **Session 7**: `pinball_ratio` added to `EvalReport.to_dict()` |
+| `src/utils/helpers.py` | **Session 7**: Pinball bias ratio + direction label in `print_eval_report`; `pinball_ratio` column in `print_cv_summary` |
+| `src/utils/run_manager.py` | **Session 7**: `pinball_ratio` in snapshot metrics; `f1` in dropdown label |
+| `documents/project_overview.md` | **Session 7**: v4.0 — full layperson technical justifications for all architecture choices; run_009 results |
+| `src/models/forecaster.py` | **Session 6**: `_quiet_prior()` data-driven per-county baseline |
+| `src/models/tft_model.py` | **Session 6**: `predict()` fixed for StratifiedWindowSampler; `_real_unique_ids` |

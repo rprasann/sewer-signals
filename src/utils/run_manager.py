@@ -10,10 +10,9 @@ from __future__ import annotations
 
 import json
 import shutil
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
 
 import pandas as pd
 
@@ -43,9 +42,11 @@ class RunMeta:
         """One-line label shown in the run selector dropdown."""
         wis  = self.metrics.get("mean_wis")
         cov  = self.metrics.get("coverage_95")
+        f1   = self.metrics.get("f1")
         wis_str = f"WIS {wis:.3f}" if isinstance(wis, float) and not _isnan(wis) else ""
         cov_str = f"Cov95 {cov*100:.1f}%" if isinstance(cov, float) and not _isnan(cov) else ""
-        parts = [p for p in [wis_str, cov_str] if p]
+        f1_str  = f"F1 {f1:.2f}" if isinstance(f1, float) and not _isnan(f1) else ""
+        parts = [p for p in [wis_str, cov_str, f1_str] if p]
         suffix = f"  [{', '.join(parts)}]" if parts else ""
         cnt_word = "county" if self.n_counties == 1 else "counties"
         return f"{self.label}  ·  {self.run_date}  ·  {self.n_counties} {cnt_word}{suffix}"
@@ -100,6 +101,8 @@ def snapshot_run(
         "forecast.parquet", "rolling_forecast.parquet", "cv_results.csv",
         "eval_summary.json", "scalers.joblib",
         "public_health_summary.txt",
+        "classification.parquet",      # OutbreakClassifier output (--two-stage)
+        "two_stage_forecast.parquet",  # gated forecast (TFT + quiet prior)
     ]
     for fname in _ARTEFACTS:
         src = proc_dir / fname
@@ -111,7 +114,7 @@ def snapshot_run(
     metrics: dict = {}
     if eval_path.exists():
         ev = json.loads(eval_path.read_text())
-        for k in ("mean_wis", "coverage_50", "coverage_95", "smape", "auc"):
+        for k in ("mean_wis", "coverage_50", "coverage_95", "mae", "pinball_ratio", "precision", "recall", "f1"):
             metrics[k] = ev.get(k)
 
     meta = {
@@ -161,11 +164,12 @@ def list_runs(runs_dir: Path | None = None) -> list[RunMeta]:
     return out
 
 
-def load_run_data(run_dir: Path) -> tuple[pd.DataFrame, pd.DataFrame, object, pd.DataFrame, dict, pd.DataFrame]:
-    """Load (processed_df, forecast_df, q_cols, cv_df, eval_dict, rolling_forecast_df) from a run directory.
+def load_run_data(run_dir: Path) -> tuple[pd.DataFrame, pd.DataFrame, object, pd.DataFrame, dict, pd.DataFrame, pd.DataFrame]:
+    """Load (processed_df, forecast_df, q_cols, cv_df, eval_dict, rolling_forecast_df, clf_df) from a run directory.
 
-    processed_df is train + val + test concatenated — the full historical timeline.
-    rolling_forecast_df is the stitched 28-week rolling holdout forecast (empty when not available).
+    processed_df     : train + val + test concatenated — full historical timeline.
+    rolling_forecast_df : stitched 28-week rolling holdout forecast (empty when not available).
+    clf_df           : OutbreakClassifier output (empty when --two-stage was not used).
     All DataFrames are already in unscaled log1p space (as exported by main.py).
     """
     from src.evaluation.metrics import QuantileColumns
@@ -206,4 +210,8 @@ def load_run_data(run_dir: Path) -> tuple[pd.DataFrame, pd.DataFrame, object, pd
     rolling_path = run_dir / "rolling_forecast.parquet"
     rolling_forecast_df = pd.read_parquet(rolling_path) if rolling_path.exists() else pd.DataFrame()
 
-    return processed_df, forecast_df, q_cols, cv_df, eval_dict, rolling_forecast_df
+    # Classification output (present only when --two-stage was used)
+    clf_path = run_dir / "classification.parquet"
+    clf_df   = pd.read_parquet(clf_path) if clf_path.exists() else pd.DataFrame()
+
+    return processed_df, forecast_df, q_cols, cv_df, eval_dict, rolling_forecast_df, clf_df

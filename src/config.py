@@ -4,8 +4,9 @@ All tuneable values live here to keep src/* free of magic numbers.
 """
 
 from pathlib import Path
-from pydantic_settings import BaseSettings
+
 from pydantic import Field
+from pydantic_settings import BaseSettings
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -53,7 +54,16 @@ SEWERSHED_COL = "wwtp_id"
 COUNTY_COL = "county_fips"
 
 # ---------------------------------------------------------------------------
-# Bay Area 9-County FIPS Codes  (State FIPS 06 = California)
+# Active geography (set at pipeline startup via apply_geography()).
+# None = use Bay Area defaults below.  Code everywhere can read
+#   cfg.ACTIVE_GEOGRAPHY  for the full GeographyConfig object (if loaded),
+# or just use the module-level variables (BAY_AREA_FIPS etc.) which are
+# overwritten by apply_geography().
+ACTIVE_GEOGRAPHY = None   # populated by src.config_geographies.apply_geography()
+
+
+# ---------------------------------------------------------------------------
+# Bay Area 9-County FIPS Codes  (default geography — overwritten by apply_geography)
 # ---------------------------------------------------------------------------
 
 BAY_AREA_FIPS: dict[str, str] = {
@@ -100,12 +110,19 @@ BAY_AREA_COUNTIES: list[str] = list(BAY_AREA_FIPS.keys())
 PRIORITY_COUNTIES: list[str] = ["6075", "6085", "6001", "6081"]  # SF, Santa Clara, Alameda, San Mateo
 
 # Counties excluded from model training and evaluation.
-# Napa and Solano joined the solid WW track too late (2 and 3 training weeks
-# respectively before the first CV cutoff) to produce a meaningful RobustScaler fit.
-# Their near-zero IQR (0.089–0.146 vs 1.3–1.7 for the 7 active counties) inflates
-# scaled feature values and corrupts the loss penalty calculations.  They are also
-# absent from the production dashboard.  BAY_AREA_FIPS is kept intact for map display.
-EXCLUDE_FIPS: list[str] = ["06055", "06095"]  # Napa, Solano
+# Empty: all 9 counties are now included.  Napa (06055) and Solano (06095) have
+# sparse WW history (2–3 training weeks before the first CV cutoff) and near-zero
+# IQR scalers; their scaled features are stabilised by SCALER_IQR_FLOOR below.
+# The OutbreakClassifier naturally suppresses them (no surge baseline established)
+# and OutbreakForecaster returns the flat quiet prior — honest and interpretable.
+EXCLUDE_FIPS: list[str] = []  # all 9 Bay Area counties included
+
+# Minimum IQR for RobustScaler per-county per-feature.
+# Counties with very sparse data (Napa, Solano: 2–3 training weeks) can produce
+# near-zero IQR, which causes division-by-near-zero in the scaler, inflating
+# scaled feature values 10–20× vs active counties.  Clamping to this floor keeps
+# all counties on a comparable [IQR-normalised] scale without dropping them.
+SCALER_IQR_FLOOR: float = 0.3
 
 
 # ---------------------------------------------------------------------------
@@ -265,7 +282,8 @@ MAX_WEEKLY_STEP_CHANGE = 1.5        # static floor / fallback when y_insample un
 # MIN_PI_WIDTH=2.5 (~86% of theoretical width) — strong enough to overcome the
 # pinball gradient that naturally collapses PIs, without dominating training.
 UNDERDISPERSION_LAMBDA = 0.5        # Phase 3 static value (superseded by Phase 4 K-ratio)
-MIN_PI_WIDTH = 2.5                  # Phase 3 static floor (superseded by Phase 4 multiplier)
+MIN_PI_WIDTH = 0.05                 # Phase 3 legacy fallback (used when y_insample absent);
+                                    # matched to MIN_PI_WIDTH_FLOOR — numerical safety net only.
 
 # Phase 4 — adaptive underdispersion penalty
 # effective_lambda = UNDERDISPERSION_K × mean_pinball_loss (dimensionless ratio).
@@ -273,19 +291,82 @@ MIN_PI_WIDTH = 2.5                  # Phase 3 static floor (superseded by Phase 
 # prevents dominance as Pinball loss falls while underdispersion lambda stays fixed.
 UNDERDISPERSION_K = 0.5             # target: underdispersion penalty ≈ 50% of pinball loss
 
-# Phase 4 — volatility-adjusted minimum PI width
+# Phase 6 — two-stage-aware minimum PI width
+# In the two-stage architecture, the TFT only runs for TRIGGERED (outbreak) counties.
+# Suppressed counties receive the data-driven quiet prior, which computes PI width
+# from actual recent std — no loss function involvement. Therefore the minimum-width
+# parameters only need to calibrate outbreak-period uncertainty, not quiet baselines.
+#
 # min_width_t = MIN_PI_WIDTH_MULTIPLIER × σ(y_insample[-4:])
-# Wider during surge onsets (high σ), narrower during calm baselines (low σ).
-MIN_PI_WIDTH_MULTIPLIER = 3.0       # multiplier on per-sample insample std; at 2.0 the dynamic
-                                    # path only exceeded Phase 3's 2.5 floor when σ>1.25 (near
-                                    # peak only); at 3.0 it activates at σ>0.83 (surge onset)
-MIN_PI_WIDTH_FLOOR = 1.5            # absolute minimum width floor (scaled units); raised
-                                    # from 0.5 in Phase 5 — the 0.5 floor allowed PI collapse
-                                    # to 0.6 scaled units in calm periods (4× below Phase 3).
-                                    # Note: _dynamic_min_width now clamps to min_pi_width (2.5)
-                                    # as its primary floor; this value is the last-resort safety net.
+#               clamped to MIN_PI_WIDTH_FLOOR (safety net against numerical collapse)
+#
+# During surge onset  (σ ≈ 0.5–1.5): min_width = 2.0 × 0.5–1.5 = 1.0–3.0 scaled units
+# During quiet period (σ ≈ 0.3):     min_width = 2.0 × 0.3 = 0.6, clamped to 0.5
+#   → pinball loss naturally drives PI toward the ~1.1–1.3 log1p empirical 95% width
+#
+# Previous values (Phase 5): MULTIPLIER=3.0, FLOOR=1.5 (effective floor was 2.5 via
+# the legacy MIN_PI_WIDTH clamp — a bug). Both forced Coverage 95% = 100% because the
+# floor exceeded the actual quiet-period variation (~1.1–1.3 log1p), trivially catching
+# every holdout observation regardless of forecast quality.
+MIN_PI_WIDTH_MULTIPLIER = 2.0       # reduced from 3.0: ~2σ scale; lets pinball loss
+                                    # govern calibration, penalty prevents extreme collapse
+MIN_PI_WIDTH_FLOOR = 0.05           # numerical safety net only — prevents degenerate
+                                    # dyn=0 when effective_vol=0 (constant series edge case).
+                                    # Does not bind in practice: outbreak vol ≫ 0.025 units,
+                                    # quiet-period vol ≈ 0.35 units → multiplier × 0.35 = 0.70.
+                                    # Pinball loss governs calibration; this floor is not a
+                                    # PI-width target.
 
 QUANTILE_LEVELS = TFT_CONFIG["quantile_levels"]
+
+
+# ---------------------------------------------------------------------------
+# OutbreakClassifier — two-stage gatekeeper (Phase 1 architecture)
+# ---------------------------------------------------------------------------
+
+# Z-score threshold against the non-elastic (training-anchored) quiet baseline.
+# Signals this many std-deviations above the quiet-period mean trigger Stage 2.
+#
+# Raised from 1.5 → 2.0 (Phase 6 two-stage calibration):
+# At 1.5, SF and SC spuriously triggered 33–37% of quiet holdout weeks because
+# their non-elastic baselines were anchored to pre-2022 WW troughs — the 2023
+# endemic WW level is structurally elevated vs those early readings. At 2.0:
+#   - SF (holdout Z_mean=3.17): still triggers during genuine signal elevations
+#   - SC (holdout Z_mean=1.88): suppressed correctly during quiet endemic period
+# The volatility adjustment (×1 + 0.5×max(σ_local/σ_mean−1, 0)) provides
+# additional discrimination for noisy high-variance counties (e.g. Solano).
+CLASSIFIER_Z_THRESHOLD: float = 2.0
+
+# Momentum divergence threshold (ww_momentum_lead, scaled units).
+# Acts as a confirmation gate: Z-score alone can fire on single-week spikes.
+# Requires WW velocity to be leading case velocity by ≥ this amount.
+# 0.0 = any positive divergence; raise toward 0.5 for fewer false positives.
+CLASSIFIER_MOMENTUM_THRESHOLD: float = 0.0
+
+# Weeks of quiet-period training signal used to anchor the baseline mean/std.
+# "Quiet" = below the training median; only those observations form the baseline.
+# Longer window = more stable baseline but may miss slow secular trends.
+CLASSIFIER_BASELINE_WEEKS: int = 8
+
+# Minimum absolute signal to consider a trigger (prevents LOD-noise alerts).
+CLASSIFIER_MIN_SIGNAL: float = 0.1
+
+# Volatility-adjusted threshold: effective_z = Z_THRESHOLD × (1 + scale × max(vol_ratio−1, 0))
+# Prevents false positives in high-noise WW environments.
+# volatility_col: the 4-week rolling std of log1p_concentration (already in processed data).
+CLASSIFIER_VOLATILITY_COL:   str   = "log1p_concentration_4w_std"
+CLASSIFIER_VOLATILITY_SCALE: float = 0.5
+
+# Cold-start handling: counties with fewer than this many training observations
+# cannot produce a reliable quiet-period baseline. They are suppressed and
+# OutbreakForecaster returns the flat quiet prior.
+MIN_BASELINE_OBSERVATIONS: int = 4
+
+# DEPRECATED — OutbreakForecaster._quiet_prior() now computes a data-driven
+# baseline from the last 8 weeks of observed TARGET_COL per county.  Setting
+# this to 0.0 (zero cases) was wrong for endemic periods and gave Coverage95=0%.
+# Kept for backward-compat imports only; not read by any production code path.
+SUPPRESSED_FORECAST_LEVEL: float = 0.0  # unused — see forecaster._quiet_prior()
 
 
 # ---------------------------------------------------------------------------

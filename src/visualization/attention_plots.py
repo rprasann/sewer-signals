@@ -368,7 +368,7 @@ def plot_vsn_importance(
                      Defaults to the canonical HIST/FUTURE lists from tft_model.
     role           : Which role's weights to display.
     """
-    from src.models.tft_model import HIST_COVARIATES, FUTURE_COVARIATES, STATIC_COVARIATES
+    from src.models.tft_model import FUTURE_COVARIATES, HIST_COVARIATES, STATIC_COVARIATES
 
     _default_names = {
         "historical": HIST_COVARIATES,

@@ -77,7 +77,6 @@ from typing import Optional
 
 import numpy as np
 import pandas as pd
-import torch
 from loguru import logger
 from neuralforecast import NeuralForecast
 from neuralforecast.models import TFT
@@ -87,7 +86,6 @@ from src.config import (
     BAY_AREA_FIPS,
     BAY_AREA_POPULATION,
     COUNTY_COL,
-    LOGS_DIR,
     MODELS_DIR,
     NWSS_DATE_COL,
     QUANTILE_LEVELS,
@@ -144,10 +142,50 @@ STATIC_COVARIATES: list[str] = [
     "is_sludge",             # 1=copies/g dry sludge (all 9 Bay Area counties), 0=liquid track
 ]
 
-# FIPS → integer encoding (stable across runs)
-_FIPS_INT: dict[str, int] = {
-    fips: idx for idx, fips in enumerate(sorted(BAY_AREA_FIPS.values()))
-}
+# FIPS → integer encoding.
+# Not computed at module import time so it always reflects the active geography
+# (which may be overwritten by apply_geography() after this module is imported).
+# _build_static_df() calls _get_fips_int() at fit time instead.
+def _get_fips_int() -> dict[str, int]:
+    """Return the current geography's FIPS→int encoding.
+
+    If a non-default geography has been loaded via apply_geography(), its
+    ACTIVE_GEOGRAPHY.fips_int_map is used.  Otherwise falls back to the
+    sorted Bay Area FIPS list.
+    """
+    import src.config as _cfg
+    if getattr(_cfg, "ACTIVE_GEOGRAPHY", None) is not None:
+        return _cfg.ACTIVE_GEOGRAPHY.fips_int_map
+    return {fips: idx for idx, fips in enumerate(sorted(_cfg.BAY_AREA_FIPS.values()))}
+
+
+# ---------------------------------------------------------------------------
+# Helper: add calendar features to an existing (unique_id, ds) DataFrame
+# ---------------------------------------------------------------------------
+
+def _add_futr_calendar_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Add FUTURE_COVARIATES calendar columns to a (unique_id, ds) DataFrame.
+
+    Called by ``WastewaterTFT.predict()`` when building futr_df from
+    ``make_future_dataframe()`` output.  Computes the same features as
+    ``build_future_df()`` but operates on an existing DataFrame rather than
+    creating one from scratch, preserving the per-series date structure that
+    ``make_future_dataframe()`` returns.
+    """
+    df   = df.copy()
+    doy  = df["ds"].dt.dayofyear
+    dow  = df["ds"].dt.dayofweek
+
+    for k in range(1, 4):
+        df[f"sin_annual_{k}"] = np.sin(2 * np.pi * k * doy / 365.25)
+        df[f"cos_annual_{k}"] = np.cos(2 * np.pi * k * doy / 365.25)
+
+    df["day_of_week_sin"] = np.sin(2 * np.pi * dow / 7)
+    df["day_of_week_cos"] = np.cos(2 * np.pi * dow / 7)
+    df["month_sin"]       = np.sin(2 * np.pi * df["ds"].dt.month / 12)
+    df["month_cos"]       = np.cos(2 * np.pi * df["ds"].dt.month / 12)
+    df["week_of_year"]    = df["ds"].dt.isocalendar().week.astype(int)
+    return df
 
 
 # ---------------------------------------------------------------------------
@@ -291,6 +329,7 @@ class WastewaterTFT:
         self.input_size = input_size
         self._nf: Optional[NeuralForecast] = None
         self._unique_ids: list[str] = []
+        self._real_unique_ids: list[str] = []   # original county FIPS, no synthetic suffix
         self._last_train_date: Optional[pd.Timestamp] = None
 
         _hw = TFT_CONFIG.get("horizon_weight")
@@ -378,6 +417,16 @@ class WastewaterTFT:
         self._unique_ids = nf_train["unique_id"].unique().tolist()
         self._last_train_date = nf_train["ds"].max()
 
+        # Synthetic sub-series from StratifiedWindowSampler have ids like
+        # "06075_ons_001".  Real county FIPS are standalone 5-digit codes with
+        # no underscore.  Track them separately so predict() can filter correctly.
+        self._real_unique_ids = [
+            uid for uid in self._unique_ids if "_" not in str(uid)
+        ]
+        if not self._real_unique_ids:
+            # No phase-aware training → all ids are real counties
+            self._real_unique_ids = self._unique_ids
+
         self._nf = NeuralForecast(models=[self._tft], freq="W-WED")
         self._nf.fit(
             df=nf_train,
@@ -400,23 +449,41 @@ class WastewaterTFT:
 
         Parameters
         ----------
-        futr_df     : Pre-built future DataFrame from ``build_future_df()``.
-                      If None, built automatically from the training horizon.
+        futr_df     : Pre-built future DataFrame.  If None, built automatically.
         horizon_df  : Alias for futr_df (accepted for API symmetry).
+
+        When ``futr_df`` is None the method uses
+        ``self._nf.make_future_dataframe(h=self.h)`` to get the **per-series**
+        correct future (unique_id, ds) combinations, then appends the calendar
+        features required by ``futr_exog_list``.
+
+        This replaces the previous ``build_future_df()`` call which used a single
+        global ``last_date`` for all series.  After ``--phase-aware-train``,
+        NeuralForecast is fitted on ~500 synthetic sub-series that end at
+        different past dates; using a single global last_date for all of them
+        causes NF to raise "missing combinations in futr_df".
         """
         if self._nf is None:
             raise RuntimeError("Model not fitted. Call fit() first.")
 
         futr = futr_df or horizon_df
         if futr is None:
-            futr = build_future_df(
-                unique_ids=self._unique_ids,
-                last_date=self._last_train_date,
-                h=self.h,
-            )
+            # make_future_dataframe() returns a (unique_id, ds) DataFrame with
+            # H rows per series, each starting from that series' own last date.
+            base = self._nf.make_future_dataframe(h=self.h)
+            futr = _add_futr_calendar_features(base)
 
         preds = self._nf.predict(futr_df=futr)
-        logger.info("Forecast produced for {} series × {} steps.", len(self._unique_ids), self.h)
+
+        # Synthetic sub-series are training-only — drop them from the output.
+        # _real_unique_ids contains only the original county FIPS codes.
+        if self._real_unique_ids:
+            preds = preds[preds["unique_id"].isin(self._real_unique_ids)].copy()
+
+        logger.info(
+            "Forecast produced for {} real series × {} steps.",
+            preds["unique_id"].nunique(), self.h,
+        )
         return preds
 
     def save(self, path: Optional[Path] = None) -> Path:
@@ -589,8 +656,12 @@ class WastewaterTFT:
         else:
             static["log_population"] = 0.0
 
+        # Compute encoding from the currently active geography (never stale).
+        # Synthetic unique_ids ("06075_ons_001") have their source FIPS as the
+        # first "_"-delimited token — handled by the split().
+        _fips_int = _get_fips_int()
         static["county_fips_encoded"] = static["unique_id"].map(
-            lambda fips: float(_FIPS_INT.get(fips, -1))
+            lambda uid: float(_fips_int.get(uid.split("_")[0], -1))
         )
         # is_sludge: added by processor Stage 3; default 1.0 (copies/g is primary unit)
         if "is_sludge" in df.columns:

@@ -94,12 +94,21 @@ from src.config import (
     VAL_END_DATE,
     WW_FEATURE_COL,
 )
+from src.config_geographies import apply_geography, list_geographies, load_geography
+from src.data_pipeline.adapters import COVID_Adapter
 from src.data_pipeline.processor import CAWastewaterProcessor
+from src.data_pipeline.sampler import PhaseLabeler, StratifiedWindowSampler
+from src.models.classifier import OutbreakClassifier
+from src.models.forecaster import OutbreakForecaster
+from src.pipeline import TwoStagePipeline
 from src.evaluation.metrics import (
-    EvalResult,
-    OutbreakWindowResult,
+    EvalReport,
     QuantileColumns,
-    evaluate,
+)
+from src.evaluation.evaluator import (
+    Evaluator,
+    OnsetLabeler,
+    OutbreakWindowResult,
     expanding_window_cv,
     run_outbreak_validation,
 )
@@ -107,6 +116,7 @@ from src.models.tft_model import WastewaterTFT
 from src.utils.helpers import (
     console,
     generate_public_health_summary,
+    print_classification_summary,
     print_cv_summary,
     print_eval_report,
     setup_logger,
@@ -163,12 +173,22 @@ def _parse_args() -> argparse.Namespace:
         ),
     )
     p.add_argument(
+        "--geography", type=str, default=None,
+        metavar="NAME",
+        help=(
+            "Geography to use.  Name must match a YAML file in "
+            "config/geographies/ (without .yaml).  "
+            f"Available: {list_geographies()}.  "
+            "Default: bay_area (no flag needed for Bay Area runs)."
+        ),
+    )
+    p.add_argument(
         "--counties", type=str, default=None,
         help=(
             "Restrict pipeline to a subset of counties.  "
-            "Pass '3county' for the spatial-temporal validation set "
-            "(SF, San Mateo, Santa Clara), or a comma-separated list of "
-            "5-digit FIPS codes (e.g. '06075,06081,06085')."
+            "Pass 'validation' for the geography's validation set "
+            "(e.g. SF/San Mateo/Santa Clara for Bay Area), or a comma-separated "
+            "list of 5-digit FIPS codes (e.g. '06075,06081,06085')."
         ),
     )
     p.add_argument(
@@ -197,6 +217,27 @@ def _parse_args() -> argparse.Namespace:
             "Defaults to TFT_CONFIG['max_steps'] (2000) or 200 with --fast."
         ),
     )
+    p.add_argument(
+        "--phase-aware-train", action="store_true",
+        help=(
+            "Enable stratified window sampling during final model training. "
+            "Labels each training week as Baseline / Onset / Peak / Decay and "
+            "oversamples minority-phase windows (onset 3×, peak 2×, decay 3×) "
+            "to prevent the TFT from learning a pure baseline prior.  "
+            "Adds ~2–5 min for labeling + sampling.  "
+            "Recommended when training on all 9 counties with --two-stage."
+        ),
+    )
+    p.add_argument(
+        "--two-stage", action="store_true",
+        help=(
+            "After training and holdout evaluation, run the two-stage gatekeeper: "
+            "fit OutbreakClassifier on cv_data, classify the holdout, and invoke "
+            "OutbreakForecaster only on triggered counties.  "
+            "Writes classification.parquet to data/processed/. "
+            "Adds ~1 min."
+        ),
+    )
     return p.parse_args()
 
 
@@ -220,9 +261,11 @@ def _load_ca_ww_csv(path: Path) -> pd.DataFrame:
         raise FileNotFoundError(f"CA WW CSV not found at {path}.")
     df = pd.read_csv(path, dtype=str, low_memory=False)
 
-    # Filter: Bay Area + SARS-CoV-2 + solid track
+    # Filter: active geography counties + SARS-CoV-2 + solid track
+    # Use cfg.BAY_AREA_COUNTIES (not the locally-bound import) so apply_geography()
+    # updates are visible here when --geography is specified.
     df = df[
-        df["County"].isin(BAY_AREA_COUNTIES) &
+        df["County"].isin(cfg.BAY_AREA_COUNTIES) &
         (df["PCR Target"] == "SARS-CoV-2") &
         (df["Sample Type"].str.lower() == "solid")
     ].copy()
@@ -259,15 +302,16 @@ def _load_ca_cases_csv(path: Path) -> pd.DataFrame:
     df["date"] = pd.to_datetime(df["date"], format="%m/%d/%y", errors="coerce")
     df["cases"] = pd.to_numeric(df["cases"], errors="coerce")
 
-    # Filter: Bay Area counties only; exclude state-level aggregate rows
+    # Filter: active geography counties only; exclude state-level aggregate rows
+    # Use cfg.BAY_AREA_COUNTIES / cfg.BAY_AREA_FIPS so apply_geography() changes propagate.
     df = df[
-        df["area"].isin(BAY_AREA_COUNTIES) &
+        df["area"].isin(cfg.BAY_AREA_COUNTIES) &
         (df["area_type"] == "County")
     ].copy()
     df = df.dropna(subset=["date", "cases"])
 
     # Map county name → FIPS (COUNTY_COL) — no FIPS lookup table needed
-    df[COUNTY_COL] = df["area"].map(BAY_AREA_FIPS)
+    df[COUNTY_COL] = df["area"].map(cfg.BAY_AREA_FIPS)
     df = df.dropna(subset=[COUNTY_COL])
 
     # Resample DAILY → W-WED weekly sum per county
@@ -299,11 +343,13 @@ def _split_raw(
     (both Wednesday-aligned W-WED dates).  The RobustScaler is fitted ONLY
     on training rows (INV-1).
     """
+    # Use cfg.* (module attribute) not locally-bound imports so apply_geography()
+    # updates are visible when --geography is specified.
     dates      = pd.to_datetime(df[date_col], errors="coerce")
-    data_start = pd.Timestamp(DATA_START_DATE)
-    data_end   = pd.Timestamp(DATA_END_DATE)
-    train_end  = pd.Timestamp(TRAIN_END_DATE)
-    val_end    = pd.Timestamp(VAL_END_DATE)
+    data_start = pd.Timestamp(cfg.DATA_START_DATE)
+    data_end   = pd.Timestamp(cfg.DATA_END_DATE)
+    train_end  = pd.Timestamp(cfg.TRAIN_END_DATE)
+    val_end    = pd.Timestamp(cfg.VAL_END_DATE)
 
     # Step 1 — overlap window filter
     df    = df[(dates >= data_start) & (dates <= data_end)].copy()
@@ -315,8 +361,8 @@ def _split_raw(
     test  = df[dates > val_end].copy()
     logger.info(
         "Raw split (overlap {} → {}): train={} (≤{}), val={}, test={} rows.",
-        DATA_START_DATE, DATA_END_DATE,
-        len(train), TRAIN_END_DATE, len(val), len(test),
+        cfg.DATA_START_DATE, cfg.DATA_END_DATE,
+        len(train), cfg.TRAIN_END_DATE, len(val), len(test),
     )
     return train, val, test
 
@@ -372,7 +418,12 @@ def _process_liquid_track(_raw_ww: pd.DataFrame) -> pd.DataFrame:
 # Step 3 — Expanding-window cross-validation
 # ---------------------------------------------------------------------------
 
-def _run_cv(cv_data: pd.DataFrame, max_steps: int) -> pd.DataFrame:
+def _run_cv(
+    cv_data: pd.DataFrame,
+    max_steps: int,
+    two_stage: bool = False,
+    phase_aware: bool = False,
+) -> pd.DataFrame:
     """Expanding-window CV confined to the 50-week CV window.
 
     Folds expand from TRAIN_END_DATE (first cutoff) to VAL_END_DATE (last
@@ -383,14 +434,6 @@ def _run_cv(cv_data: pd.DataFrame, max_steps: int) -> pd.DataFrame:
     on raw_train only (INV-1) so no leakage occurs in any fold.
     """
     logger.info("Expanding-window cross-validation (max_steps={}) …", max_steps)
-    # Three overrides required for CV fold models:
-    # 1. enable_progress_bar=False / enable_model_summary=False: PL's Rich Live
-    #    display conflicts with the outer expanding_window_cv progress bar.
-    # 2. early_stop_patience_steps=-1: disables early stopping so val_size=0 is
-    #    valid for all folds — early stopping is irrelevant in CV since each fold
-    #    is evaluated externally via evaluate(). Without this, folds where the
-    #    shortest county series <= h + lag_warmup (Napa at early cutoffs) would
-    #    hit "Set val_size>0 or provide val_df if early stopping is enabled".
     cv_trainer_kwargs = {
         "enable_progress_bar": False,
         "enable_model_summary": False,
@@ -401,9 +444,11 @@ def _run_cv(cv_data: pd.DataFrame, max_steps: int) -> pd.DataFrame:
         model_factory=lambda: WastewaterTFT(
             max_steps=max_steps, trainer_kwargs=cv_trainer_kwargs
         ),
-        initial_train_end=TRAIN_END_DATE,
-        eval_end=VAL_END_DATE,
+        initial_train_end=cfg.TRAIN_END_DATE,
+        eval_end=cfg.VAL_END_DATE,
         step_weeks=4,
+        two_stage=two_stage,
+        phase_aware=phase_aware,
     )
 
 
@@ -664,7 +709,7 @@ def _export_results(
     test_df: pd.DataFrame,
     forecast_df: pd.DataFrame,
     cv_df: pd.DataFrame,
-    eval_result: EvalResult,
+    eval_report: "EvalReport",
 ) -> None:
     """Write all pipeline artefacts to data/processed/."""
     PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
@@ -675,7 +720,7 @@ def _export_results(
     if not cv_df.empty:
         cv_df.to_csv(PROCESSED_DIR / "cv_results.csv", index=False)
     (PROCESSED_DIR / "eval_summary.json").write_text(
-        json.dumps(eval_result.to_dict(), indent=2, default=str)
+        json.dumps(eval_report.to_dict(), indent=2, default=str)
     )
     logger.info("Artefacts exported to {}.", PROCESSED_DIR)
 
@@ -688,6 +733,12 @@ def main() -> None:
     load_dotenv()
     args   = _parse_args()
     setup_logger()
+
+    # ── Geography must be loaded FIRST — overwrites BAY_AREA_FIPS etc. in cfg ──
+    if args.geography:
+        apply_geography(load_geography(args.geography))
+    # Default (no flag): Bay Area constants already set in config.py at import time.
+
     cfg.settings = cfg.EnvSettings()
 
     # ── --dash-only: skip all pipeline steps, load from last export ─────────
@@ -728,7 +779,8 @@ def main() -> None:
     max_steps = 200 if args.fast else (args.max_steps or cfg.TFT_CONFIG["max_steps"])
     cv_steps  = min(max_steps, 500)
 
-    console.rule("[bold white] Sewer Signals — Bay Area Wastewater Surveillance [/bold white]")
+    _geo_label = getattr(getattr(cfg, "ACTIVE_GEOGRAPHY", None), "name", "Bay Area")
+    console.rule(f"[bold white] Sewer Signals — {_geo_label} Wastewater Surveillance [/bold white]")
     logger.info(
         "Config: max_steps={}, skip_cv={}, no_dash={}, port={}",
         max_steps, skip_cv, args.no_dash, args.port,
@@ -746,9 +798,12 @@ def main() -> None:
         raw_cases = raw_cases[~raw_cases[cfg.COUNTY_COL].isin(cfg.EXCLUDE_FIPS)].copy()
         logger.info("Excluded {} (insufficient WW history): {}", cfg.EXCLUDE_FIPS, _excl_names)
 
-    # Optional county filter (--counties 3county | --counties 06075,06081,06085)
+    # Optional county filter (--counties validation | --counties 06075,06081,06085)
+    # "validation" resolves to the current geography's validation set.
+    # "3county" is kept as a legacy alias for Bay Area backward compatibility.
     if args.counties:
-        if args.counties.strip().lower() == "3county":
+        token = args.counties.strip().lower()
+        if token in ("validation", "3county"):
             county_filter = cfg.THREE_COUNTY_FIPS
         else:
             county_filter = [f.strip() for f in args.counties.split(",")]
@@ -777,27 +832,62 @@ def main() -> None:
     # ── 3. Cross-validation (runs entirely within the 50-week CV window) ──────
     cv_df = pd.DataFrame()
     if not skip_cv:
-        cv_df = _run_cv(cv_data, max_steps=cv_steps)
+        cv_df = _run_cv(
+            cv_data,
+            max_steps=cv_steps,
+            two_stage=args.two_stage,
+            phase_aware=args.phase_aware_train,
+        )
         print_cv_summary(cv_df)
 
     # ── 4. Final model ────────────────────────────────────────────────────────
     # Train on ALL 50 CV-window weeks so the H=8-step forecast lands inside
     # the 15-week holdout.  INV-1 holds: RobustScaler was fitted only on
     # raw_train rows; val_df went through proc.transform() (no re-fitting).
-    model, forecast_df = _train_final_model(cv_data, max_steps=max_steps)
+    # ── 4a. Phase-Aware Training (optional) ──────────────────────────────────
+    # When --phase-aware-train is set, label each training week as
+    # Baseline / Onset / Peak / Decay and oversample minority phases so the
+    # TFT trains on a balanced distribution across all epidemic regimes.
+    train_data = cv_data
+    if args.phase_aware_train:
+        console.rule("[bold cyan] Phase-Aware Training — Stratified Window Sampling [/bold cyan]")
+        logger.info(
+            "Labeling {} rows across {} counties with epidemic phases …",
+            len(cv_data), cv_data[COUNTY_COL].nunique(),
+        )
+        phase_labeler = PhaseLabeler()
+        phase_labeler.fit(train_df)          # fit on raw training split only
+        labeled_data  = phase_labeler.label(cv_data)
+        phase_dist    = phase_labeler.phase_distribution(labeled_data)
+        logger.info(
+            "Phase distribution before sampling:\n{}",
+            phase_dist.to_string(index=False),
+        )
+        sampler    = StratifiedWindowSampler(
+            input_size=cfg.TFT_CONFIG["input_size"],
+            h=cfg.TFT_CONFIG["h"],
+        )
+        train_data = sampler.sample(labeled_data)
+        logger.info(
+            "Training on {} rows ({} unique series) after stratified sampling.",
+            len(train_data), train_data[COUNTY_COL].nunique(),
+        )
+
+    model, forecast_df = _train_final_model(train_data, max_steps=max_steps)
     model.save()
     q_cols = QuantileColumns.auto_detect(forecast_df)
 
     # ── 5. Evaluation on holdout test set ────────────────────────────────────
-    # evaluate() now returns an empty EvalResult (n_observations=0) instead of
-    # raising when the forecast window doesn't overlap — we guard on that here.
-    eval_result = evaluate(
+    # Fit the onset labeler on cv_data (train+val) so it uses only pre-holdout
+    # data for threshold computation — no leakage into the test set.
+    labeler     = OnsetLabeler().fit(cv_data)
+    evaluator   = Evaluator(labeler=labeler, q_cols=q_cols)
+    eval_report = evaluator.score(
         actual_df=test_df,
         forecast_df=forecast_df,
-        q_cols=q_cols,
     )
-    if eval_result.n_observations > 0:
-        print_eval_report(eval_result, title="Final Evaluation — Holdout Test Set")
+    if eval_report.prob.n_observations > 0:
+        print_eval_report(eval_report, title="Final Evaluation — Holdout Test Set")
     else:
         logger.warning(
             "Holdout evaluation skipped: forecast window [{} → {}] does not "
@@ -806,7 +896,46 @@ def main() -> None:
             forecast_df["ds"].max().date() if not forecast_df.empty else "?",
         )
 
-    # ── 5b. Rolling holdout evaluation (optional) ────────────────────────────
+    # ── 5b. Two-stage gatekeeper (optional) ─────────────────────────────────
+    # Fits OutbreakClassifier on the CV training window, classifies the full
+    # holdout panel, and invokes OutbreakForecaster only on triggered counties.
+    # Saves classification.parquet so the dashboard can show per-county alerts.
+    if args.two_stage:
+        console.rule("[bold cyan] Two-Stage Gatekeeper [/bold cyan]")
+        logger.info("Fitting OutbreakClassifier on cv_data ({} rows).", len(cv_data))
+
+        # Stage 1 — fit classifier on training window, classify full panel
+        classifier = OutbreakClassifier()
+        classifier.fit(cv_data)
+        clf_df     = classifier.classify_df(sludge_all)
+        triggered  = classifier.triggered_counties(clf_df)
+        suppressed = classifier.suppressed_counties(clf_df)
+
+        # Rich terminal summary table — per-county Z-score, trigger rate, episodes
+        print_classification_summary(clf_df)
+
+        # Stage 2 — conditional forecaster (TFT only for triggered counties)
+        forecaster       = OutbreakForecaster(model=model, q_cols=q_cols)
+        two_stage_result = forecaster.predict(
+            processed_df=sludge_all,
+            triggered_ids=triggered,
+            all_ids=sorted(sludge_all[COUNTY_COL].unique().tolist()),
+        )
+
+        # Persist for dashboard overlay and run snapshot
+        clf_df.to_parquet(PROCESSED_DIR / "classification.parquet", index=False)
+        if not two_stage_result.empty:
+            two_stage_result.to_parquet(
+                PROCESSED_DIR / "two_stage_forecast.parquet", index=False
+            )
+        logger.info(
+            "Two-stage complete — {}/{} counties triggered  "
+            "classification.parquet + two_stage_forecast.parquet written.",
+            len(triggered),
+            len(triggered) + len(suppressed),
+        )
+
+    # ── 5c. Rolling holdout evaluation (optional) ────────────────────────────
     # Extends evaluation across the full 28-week holdout by stepping a 4-week
     # window from VAL_END_DATE → DATA_END_DATE.  Each step retrains the model
     # on all data up to that cutoff, producing ~5 overlapping 8-week forecasts.
@@ -823,6 +952,7 @@ def main() -> None:
             "early_stop_patience_steps": -1,
         }
         _rolling_forecast_frames: list[pd.DataFrame] = []
+        _fold_store = PROCESSED_DIR / "rolling_holdout_folds"
         rolling_df = expanding_window_cv(
             processed_df=sludge_all,
             model_factory=lambda: WastewaterTFT(
@@ -832,7 +962,11 @@ def main() -> None:
             eval_end=cfg.DATA_END_DATE,
             step_weeks=4,
             forecast_collector=_rolling_forecast_frames,
+            fold_store_dir=_fold_store,
+            two_stage=args.two_stage,          # gate each rolling fold when --two-stage
+            phase_aware=args.phase_aware_train, # oversample onset/peak/decay per fold
         )
+        logger.info("Per-fold parquets written to {}.", _fold_store)
         if not rolling_df.empty:
             console.rule("[bold]Rolling Holdout — Full 28-Week Coverage[/bold]")
             print_cv_summary(rolling_df)
@@ -881,7 +1015,7 @@ def main() -> None:
     _export_results(
         train_display, val_display, test_display,
         forecast_display,  # all four now in unscaled log1p space
-        cv_df, eval_result,
+        cv_df, eval_report,
     )
 
     # ── 7b. Run snapshot ─────────────────────────────────────────────────────
@@ -890,12 +1024,20 @@ def main() -> None:
     _snap_label     = args.run_name if args.run_name else datetime.now().strftime("%Y%m%d_%H%M")
     active_fips     = sorted(train_df[COUNTY_COL].unique().tolist())
     active_counties = [cfg.FIPS_TO_COUNTY.get(f, f) for f in active_fips]
+    _active_flags = [
+        f"max_steps={max_steps}",
+        f"skip_cv={skip_cv}",
+        *(["two_stage"]       if args.two_stage         else []),
+        *(["phase_aware"]     if args.phase_aware_train  else []),
+        *(["rolling_holdout"] if args.rolling_holdout    else []),
+        *(["geography=" + args.geography] if args.geography else []),
+    ]
     _run_id, _run_dir = snapshot_run(
         proc_dir   = PROCESSED_DIR,
         run_label  = _snap_label,
         counties   = active_counties,
-        phase      = "Phase 5",
-        notes      = f"max_steps={max_steps}, skip_cv={skip_cv}",
+        phase      = "Phase 6",
+        notes      = ", ".join(_active_flags),
     )
     console.print(f"  [bold green]Run snapshot saved:[/bold green] {_run_id}  →  {_run_dir}")
 
@@ -923,17 +1065,15 @@ def main() -> None:
             console.print("\n  [bold]Outbreak Validation Summary[/bold]")
             console.print(
                 f"  {'Window':<20} {'Counties':>8} {'Cov95':>7} {'WIS':>7} "
-                f"{'Sens':>7} {'AUC':>7} {'Alerts':>7}"
+                f"{'MAE':>7}"
             )
-            console.print("  " + "─" * 65)
+            console.print("  " + "─" * 55)
             for obr in outbreak_results:
-                er   = obr.eval_result
-                sens = er.lead_time.sensitivity
+                er = obr.eval_report
                 console.print(
                     f"  {obr.name:<20} {obr.n_counties:>8} "
-                    f"{er.coverage_95:>7.1%} {er.mean_wis:>7.3f} "
-                    f"{'N/A' if (isinstance(sens,float) and np.isnan(sens)) else f'{sens:>7.2f}'} "
-                    f"{er.lead_time.auc:>7.3f} {er.n_predicted_alerts:>7}"
+                    f"{er.prob.coverage_95:>7.1%} {er.prob.mean_wis:>7.3f} "
+                    f"{er.prob.mae:>7.4f}"
                 )
         else:
             logger.warning("No outbreak validation windows completed successfully.")
@@ -949,9 +1089,9 @@ def main() -> None:
             forecast_cases = _build_decoded_forecast(forecast_df, proc, q_cols)
             summary = generate_public_health_summary(
                 forecast_df=forecast_cases,
-                eval_result=eval_result,
+                eval_report=eval_report,
                 vsn_weights=vsn_weights,
-                county_fips=list(BAY_AREA_FIPS.values()),
+                county_fips=list(cfg.BAY_AREA_FIPS.values()),
                 base_url=cfg.settings.local_llm_base_url,
                 model=cfg.settings.local_llm_model,
             )
@@ -998,6 +1138,7 @@ def main() -> None:
             sludge_df=sludge_all,             # has `concentration` col for two-track chart
             liquid_df=liquid_all,             # is_sludge=0.0, SECONDARY_UNIT  [INV-3]
             q_cols=dash_q_cols,
+            eval_result=eval_report,          # populates bio table with live holdout metrics
             runs_dir=RUNS_DIR,               # enables run selector in dashboard
             rolling_forecast_df=_dash_rolling,
         )

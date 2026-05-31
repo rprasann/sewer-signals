@@ -19,11 +19,11 @@ from rich.columns import Columns
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
-from rich.text import Text
 
 if TYPE_CHECKING:
     import pandas as pd
-    from src.evaluation.metrics import EvalResult, LeadTimeResult
+
+    from src.evaluation.metrics import EvalReport
 
 console = Console()
 
@@ -66,6 +66,7 @@ def print_pinball_asymmetry_table(quantile_levels: list[float]) -> None:
     learns calibrated uncertainty bands.
     """
     import torch
+
     from src.models.loss_functions import PinballLoss
 
     table = Table(
@@ -83,7 +84,7 @@ def print_pinball_asymmetry_table(quantile_levels: list[float]) -> None:
 
     for q in quantile_levels:
         idx = quantile_levels.index(q)
-        q_tensor = torch.tensor([[quantile_levels]])
+        torch.tensor([[quantile_levels]])
 
         y_over  = torch.zeros(1, 1, len(quantile_levels))
         y_under = torch.zeros(1, 1, len(quantile_levels))
@@ -121,8 +122,9 @@ def print_pinn_comparison_table(scenarios: list[dict]) -> None:
     """
     import torch
     from neuralforecast.losses.pytorch import MQLoss
-    from src.models.loss_functions import PINNWastewaterLoss
+
     from src.config import QUANTILE_LEVELS
+    from src.models.loss_functions import PINNWastewaterLoss
 
     mql  = MQLoss(quantiles=QUANTILE_LEVELS)
     pinn = PINNWastewaterLoss(quantiles=QUANTILE_LEVELS)
@@ -179,10 +181,13 @@ def print_pinn_comparison_table(scenarios: list[dict]) -> None:
 # Evaluation report
 # ---------------------------------------------------------------------------
 
-def print_eval_report(result: "EvalResult", title: str = "Evaluation Report") -> None:
-    """Print a rich multi-panel evaluation report from an ``EvalResult``."""
+def print_eval_report(result: "EvalReport", title: str = "Evaluation Report") -> None:
+    """Print a rich multi-panel evaluation report from an ``EvalReport``."""
 
-    # ── Probabilistic metrics ──────────────────────────────────────────────
+    prob = result.prob
+    det  = result.det
+
+    # ── Category 1: Probabilistic metrics ─────────────────────────────────
     prob_table = Table(box=box.SIMPLE, show_header=False, padding=(0, 2))
     prob_table.add_column("Metric", style="bold")
     prob_table.add_column("Value", justify="right")
@@ -190,24 +195,45 @@ def print_eval_report(result: "EvalResult", title: str = "Evaluation Report") ->
 
     prob_table.add_row(
         "Mean WIS",
-        f"{result.mean_wis:.4f}",
-        "Lower is better  (0 = perfect, ↑ = more miscalibrated)",
+        f"{prob.mean_wis:.4f}",
+        "Lower is better  (0 = perfect)",
     )
     prob_table.add_row(
         "Coverage 50 % PI",
-        _badge_coverage(result.coverage_50, 0.50),
-        "Should be ≈ 50 %  (well-calibrated uncertainty)",
+        _badge_coverage(prob.coverage_50, 0.50),
+        "Should be ≈ 50 %",
     )
     prob_table.add_row(
         "Coverage 95 % PI",
-        _badge_coverage(result.coverage_95, 0.95),
-        "Should be ≈ 95 %  (well-calibrated uncertainty)",
+        _badge_coverage(prob.coverage_95, 0.95),
+        "Should be ≈ 95 %",
     )
     prob_table.add_row(
-        "SMAPE",
-        f"{result.smape:.4f}",
-        "0 = perfect, 2.0 = maximum, <0.2 = good for surveillance",
+        "MAE (median)",
+        f"{prob.mae:.4f}",
+        "Mean absolute error of the median forecast (log1p scale)",
     )
+
+    # ── Pinball by quantile ───────────────────────────────────────────────
+    pb_table = Table(box=box.SIMPLE, show_header=True, header_style="bold cyan")
+    pb_table.add_column("Quantile")
+    pb_table.add_column("Pinball loss", justify="right")
+    for q_label, pb_val in prob.pinball_by_quantile.items():
+        pb_table.add_row(q_label, f"{pb_val:.4f}")
+
+    # Bias ratio — the single most actionable calibration signal
+    _q10 = prob.pinball_by_quantile.get("q0.10", float("nan"))
+    _q90 = prob.pinball_by_quantile.get("q0.90", float("nan"))
+    if not (np.isnan(_q10) or np.isnan(_q90) or _q90 == 0):
+        _ratio = _q10 / _q90
+        _ratio_color = "red" if _ratio > 2.0 else ("yellow" if _ratio > 1.3 else ("green" if _ratio < 1.3 else "white"))
+        _bias_dir = "→ shift forecast DOWN" if _ratio > 1.5 else ("→ shift forecast UP" if _ratio < 0.67 else "→ well-calibrated")
+        pb_table.add_section()
+        pb_table.add_row(
+            "[bold]Bias ratio q10/q90[/bold]",
+            f"[{_ratio_color}]{_ratio:.2f}×[/{_ratio_color}]",
+        )
+        pb_table.add_row("", f"[dim]{_bias_dir}[/dim]")
 
     # ── WIS by county ─────────────────────────────────────────────────────
     county_table = Table(box=box.SIMPLE, show_header=True, header_style="bold cyan")
@@ -215,59 +241,65 @@ def print_eval_report(result: "EvalResult", title: str = "Evaluation Report") ->
     county_table.add_column("Mean WIS", justify="right")
     county_table.add_column("Bar", justify="left")
 
-    max_wis = max(result.wis_per_county.values(), default=1.0) or 1.0
-    for fips, val in sorted(result.wis_per_county.items(), key=lambda kv: -kv[1]):
+    max_wis = max(prob.wis_by_county.values(), default=1.0) or 1.0
+    for fips, val in sorted(prob.wis_by_county.items(), key=lambda kv: -kv[1]):
         bar_len = int(20 * val / max_wis)
         bar = "[red]" + "█" * bar_len + "[/red]" + "░" * (20 - bar_len)
         county_table.add_row(fips, f"{val:.4f}", bar)
 
-    # ── Outbreak & lead-time ───────────────────────────────────────────────
-    lt = result.lead_time
-    outbreak_table = Table(box=box.SIMPLE, show_header=False, padding=(0, 2))
-    outbreak_table.add_column("Metric", style="bold")
-    outbreak_table.add_column("Value", justify="right")
-    outbreak_table.add_column("Interpretation", style="dim")
+    # ── Category 2: Detection metrics ────────────────────────────────────
+    det_table = Table(box=box.SIMPLE, show_header=False, padding=(0, 2))
+    det_table.add_column("Metric", style="bold")
+    det_table.add_column("Value", justify="right")
+    det_table.add_column("Interpretation", style="dim")
 
-    outbreak_table.add_row("Actual onset events", str(result.n_actual_onsets), "")
-    outbreak_table.add_row("Model alerts issued",  str(result.n_predicted_alerts), "")
-    outbreak_table.add_row("True Positives",  str(lt.tp), "")
-    outbreak_table.add_row("False Positives", str(lt.fp), "[dim]Unnecessary alerts[/dim]")
-    outbreak_table.add_row("False Negatives", str(lt.fn), "[dim]Missed outbreaks[/dim]")
-    outbreak_table.add_row("True Negatives",  str(lt.tn), "")
-    outbreak_table.add_row(
-        "Sensitivity",
-        _badge_metric(lt.sensitivity, 0.70, 0.85),
-        "TP / (TP+FN)  — fraction of real outbreaks caught",
-    )
-    outbreak_table.add_row(
-        "Specificity",
-        _badge_metric(lt.specificity, 0.70, 0.85),
-        "TN / (TN+FP)  — fraction of non-outbreaks correctly silent",
-    )
-    outbreak_table.add_row(
-        "AUC",
-        _badge_metric(lt.auc, 0.70, 0.85),
-        "0.5 = random, >0.80 = actionable, >0.90 = excellent",
-    )
-    outbreak_table.add_row(
-        "Mean lead time",
-        f"{lt.mean_lead_days:.1f} days" if not np.isnan(lt.mean_lead_days) else "N/A",
-        "Positive = model alerts BEFORE clinical onset (target: 7–21 days)",
-    )
+    if det is not None:
+        det_table.add_row("True onsets (ground truth)", str(det.n_actual_onsets), "")
+        det_table.add_row("Alerts issued",               str(det.n_alerts),        "")
+        det_table.add_row("True Positives",  str(det.tp), "")
+        det_table.add_row("False Positives", str(det.fp), "[dim]Unnecessary alerts[/dim]")
+        det_table.add_row("False Negatives", str(det.fn), "[dim]Missed outbreaks[/dim]")
+        det_table.add_row(
+            "Precision",
+            _badge_metric(det.precision, 0.60, 0.80),
+            "TP / (TP+FP)  — of all alerts, how many were real?",
+        )
+        det_table.add_row(
+            "Recall",
+            _badge_metric(det.recall, 0.70, 0.85),
+            "TP / (TP+FN)  — of all real outbreaks, how many caught?",
+        )
+        det_table.add_row(
+            "F1 Score",
+            _badge_metric(det.f1, 0.65, 0.80),
+            "Harmonic mean of Precision and Recall",
+        )
+        det_table.add_row(
+            "Mean TTD",
+            f"{det.mean_ttd_days:.1f} days" if not np.isnan(det.mean_ttd_days) else "N/A",
+            "onset − alert date  (positive = WW alerted BEFORE clinical onset)",
+        )
+    else:
+        det_table.add_row(
+            "[dim]Detection metrics[/dim]",
+            "[dim]N/A[/dim]",
+            "Provide alert_df from OutbreakClassifier to enable",
+        )
 
     # ── Render ─────────────────────────────────────────────────────────────
     console.rule(f"[bold white] {title} [/bold white]")
     cutoff_str = str(result.cutoff_date.date()) if result.cutoff_date else "all data"
     console.print(
         f"  [dim]Cutoff:[/dim] {cutoff_str}   "
-        f"[dim]Series:[/dim] {result.n_series}   "
-        f"[dim]Observations:[/dim] {result.n_observations}"
+        f"[dim]Series:[/dim] {prob.n_series}   "
+        f"[dim]Observations:[/dim] {prob.n_observations}"
     )
     console.print(Columns([
-        Panel(prob_table,    title="[bold]Probabilistic Metrics[/bold]", border_style="blue"),
-        Panel(county_table,  title="[bold]WIS by County[/bold]",        border_style="blue"),
+        Panel(prob_table,   title="[bold]Probabilistic Metrics[/bold]",  border_style="blue"),
+        Panel(pb_table,     title="[bold]Pinball by Quantile[/bold]",    border_style="blue"),
+        Panel(county_table, title="[bold]WIS by County[/bold]",          border_style="blue"),
     ]))
-    console.print(Panel(outbreak_table, title="[bold]Outbreak Detection & Lead Time[/bold]", border_style="magenta"))
+    console.print(Panel(det_table, title="[bold]Outbreak Detection[/bold]", border_style="magenta"))
     _print_key_takeaways(result)
     console.print()
 
@@ -281,7 +313,6 @@ def print_outbreak_timeline(
     max_rows: int = 40,
 ) -> None:
     """Print a chronological timeline of detected onset events."""
-    import pandas as pd
 
     events = df_with_onsets[df_with_onsets[onset_col]].sort_values(date_col)
 
@@ -310,27 +341,113 @@ def print_outbreak_timeline(
     console.print(table)
 
 
+def print_classification_summary(
+    clf_df: "pd.DataFrame",
+    title: str = "OutbreakClassifier — Two-Stage Gatekeeper Results",
+) -> None:
+    """Print a rich per-county classification summary to the terminal.
+
+    Shows triggered weeks, trigger rate, mean Z-score, number of distinct
+    surge episodes, and whether Stage 2 (TFT) was invoked per county.
+
+    Parameters
+    ----------
+    clf_df : Output of ``OutbreakClassifier.classify_df()`` — must have columns
+             unique_id, date, triggered (bool), z_score, momentum.
+    """
+    from src.config import FIPS_TO_COUNTY
+
+    if clf_df.empty:
+        console.print("[dim]No classification data to display.[/dim]")
+        return
+
+    console.rule(f"[bold white] {title} [/bold white]")
+
+    table = Table(
+        box=box.ROUNDED,
+        show_header=True,
+        header_style="bold cyan",
+        title=f"[bold]{clf_df['unique_id'].nunique()} Counties  ·  {len(clf_df)} county-weeks[/bold]",
+    )
+    table.add_column("County",          style="bold", min_width=14)
+    table.add_column("Triggered",       justify="right")
+    table.add_column("Total",           justify="right")
+    table.add_column("Trigger rate",    justify="right")
+    table.add_column("Mean Z-score",    justify="right")
+    table.add_column("Surge episodes",  justify="right")
+    table.add_column("Stage 2 (TFT)",   justify="center")
+
+    for uid in sorted(clf_df["unique_id"].unique()):
+        sub = clf_df[clf_df["unique_id"] == uid].sort_values("date")
+        n_triggered = int(sub["triggered"].sum())
+        n_total     = len(sub)
+        rate        = n_triggered / n_total if n_total > 0 else 0.0
+        z_vals      = sub["z_score"].dropna()
+        mean_z      = float(z_vals.mean()) if len(z_vals) > 0 else float("nan")
+
+        # Count surge episodes: transitions from False→True in triggered
+        trig_series  = sub["triggered"].reset_index(drop=True)
+        prev         = trig_series.shift(1).fillna(False)
+        n_episodes   = int((trig_series & ~prev).sum())
+
+        county_name = FIPS_TO_COUNTY.get(str(uid), str(uid))
+        if n_triggered > 0:
+            stage2_badge = "[bold green]✓ Active[/bold green]"
+            rate_str     = f"[bold yellow]{rate:.1%}[/bold yellow]"
+        else:
+            stage2_badge = "[dim]— Suppressed[/dim]"
+            rate_str     = f"[dim]{rate:.1%}[/dim]"
+
+        table.add_row(
+            county_name,
+            str(n_triggered),
+            str(n_total),
+            rate_str,
+            f"{mean_z:.2f}" if not np.isnan(mean_z) else "[dim]N/A[/dim]",
+            str(n_episodes),
+            stage2_badge,
+        )
+
+    console.print(table)
+
+    # Summary line
+    n_active     = int(clf_df.groupby("unique_id")["triggered"].any().sum())
+    n_counties   = int(clf_df["unique_id"].nunique())
+    n_trig_weeks = int(clf_df["triggered"].sum())
+    n_total_w    = len(clf_df)
+    rate_overall = n_trig_weeks / n_total_w if n_total_w > 0 else 0.0
+
+    color = "green" if n_active > 0 else "dim"
+    console.print(
+        f"  [{color}]Stage 2 (TFT) active for {n_active}/{n_counties} counties  ·  "
+        f"{n_trig_weeks}/{n_total_w} county-weeks triggered ({rate_overall:.1%})[/{color}]"
+    )
+    console.print()
+
+
 def print_cv_summary(cv_df: "pd.DataFrame") -> None:
     """Print a compact cross-validation results table."""
     if cv_df.empty:
         console.print("[red]No CV folds completed.[/red]")
         return
 
+    # Columns in display order — gracefully skipped when absent
+    _COLS = [
+        "cutoff_date", "mean_wis", "coverage_50", "coverage_95",
+        "mae", "pinball_ratio", "precision", "recall", "f1", "mean_ttd_days",
+    ]
+
     table = Table(
         title=f"[bold]Expanding-Window Cross-Validation  ({len(cv_df)} folds)[/bold]",
         box=box.ROUNDED, show_header=True, header_style="bold cyan",
     )
-    for col in ["cutoff_date", "mean_wis", "coverage_50", "coverage_95",
-                "smape", "sensitivity", "specificity", "auc", "mean_lead_days"]:
-        if col in cv_df.columns:
-            table.add_column(col.replace("_", " ").title(), justify="right")
+    present = [c for c in _COLS if c in cv_df.columns]
+    for col in present:
+        table.add_column(col.replace("_", " ").title(), justify="right")
 
     for _, row in cv_df.iterrows():
         vals = []
-        for col in ["cutoff_date", "mean_wis", "coverage_50", "coverage_95",
-                    "smape", "sensitivity", "specificity", "auc", "mean_lead_days"]:
-            if col not in cv_df.columns:
-                continue
+        for col in present:
             v = row[col]
             if col == "cutoff_date":
                 vals.append(str(v)[:10] if v is not None else "—")
@@ -340,14 +457,11 @@ def print_cv_summary(cv_df: "pd.DataFrame") -> None:
                 vals.append(f"{v:.3f}" if isinstance(v, float) else str(v))
         table.add_row(*vals)
 
-    # Summary row
-    numeric_cols = [c for c in ["mean_wis", "smape", "auc"] if c in cv_df.columns]
+    # Summary row (means of numeric columns)
+    numeric_cols = [c for c in ["mean_wis", "mae"] if c in cv_df.columns]
     means = {c: cv_df[c].mean() for c in numeric_cols}
     summary_vals = []
-    for col in ["cutoff_date", "mean_wis", "coverage_50", "coverage_95",
-                "smape", "sensitivity", "specificity", "auc", "mean_lead_days"]:
-        if col not in cv_df.columns:
-            continue
+    for col in present:
         if col == "cutoff_date":
             summary_vals.append("[bold]MEAN[/bold]")
         elif col in means:
@@ -359,13 +473,12 @@ def print_cv_summary(cv_df: "pd.DataFrame") -> None:
 
     console.print(table)
 
-    # Trend note
     if "mean_wis" in cv_df.columns and len(cv_df) >= 3:
         wis_trend = np.polyfit(range(len(cv_df)), cv_df["mean_wis"].fillna(0), 1)[0]
         if wis_trend > 0.01:
-            console.print("[red]⚠  WIS is trending upward across folds — model may struggle on later waves.[/red]")
+            console.print("[red]⚠  WIS trending upward — model may struggle on later waves.[/red]")
         elif wis_trend < -0.01:
-            console.print("[green]✓  WIS is trending downward — model improves as training window expands.[/green]")
+            console.print("[green]✓  WIS trending downward — model improves as window expands.[/green]")
         else:
             console.print("[dim]WIS stable across folds.[/dim]")
 
@@ -376,7 +489,7 @@ def print_cv_summary(cv_df: "pd.DataFrame") -> None:
 
 def generate_public_health_summary(
     forecast_df: "pd.DataFrame",
-    eval_result: "EvalResult",
+    eval_report: "EvalReport",
     vsn_weights: dict,
     county_fips: list[str] | None = None,
     base_url: str | None = None,
@@ -414,7 +527,6 @@ def generate_public_health_summary(
     ------
     RuntimeError if the LM Studio server is unreachable or returns an error.
     """
-    from openai import OpenAI
     from src.config import FIPS_TO_COUNTY, LLM_MAX_TOKENS, LOCAL_LLM_BASE_URL, LOCAL_LLM_MODEL
 
     _base_url = base_url or LOCAL_LLM_BASE_URL
@@ -460,26 +572,28 @@ def generate_public_health_summary(
         vsn_lines.append(f"  {role.title()}: {items}")
 
     # ── Evaluation summary ────────────────────────────────────────────────────
-    lt = eval_result.lead_time
-    rec_str = (
-        f"{eval_result.mean_recovery_weeks:.1f} weeks"
-        if not np.isnan(eval_result.mean_recovery_weeks)
-        else "N/A (insufficient data)"
-    )
+    prob = eval_report.prob
+    det  = eval_report.det
+    det_str = ""
+    if det is not None:
+        def _fv(v: float) -> str:
+            return f"{v:.3f}" if not np.isnan(v) else "N/A"
+        det_str = (
+            f"  Precision                      = {_fv(det.precision)}\n"
+            f"  Recall                         = {_fv(det.recall)}\n"
+            f"  F1 Score                       = {_fv(det.f1)}\n"
+            f"  Mean TTD                       = {_fv(det.mean_ttd_days)} days  "
+            f"(positive = WW alerted before clinical onset)\n"
+        )
     eval_section = (
-        f"  Weighted Interval Score (WIS)  = {eval_result.mean_wis:.4f}  "
+        f"  Weighted Interval Score (WIS)  = {prob.mean_wis:.4f}  "
         f"(lower is better)\n"
-        f"  Symmetric MAPE (SMAPE)         = {eval_result.smape:.4f}\n"
-        f"  50 % PI coverage               = {eval_result.coverage_50:.1%}  "
+        f"  MAE (median forecast)          = {prob.mae:.4f}\n"
+        f"  50 % PI coverage               = {prob.coverage_50:.1%}  "
         f"(target 50 %)\n"
-        f"  95 % PI coverage               = {eval_result.coverage_95:.1%}  "
+        f"  95 % PI coverage               = {prob.coverage_95:.1%}  "
         f"(target 95 %)\n"
-        f"  Sensitivity                    = {lt.sensitivity:.3f}\n"
-        f"  Specificity                    = {lt.specificity:.3f}\n"
-        f"  AUC                            = {lt.auc:.3f}\n"
-        f"  Mean lead time                 = {lt.mean_lead_days:.1f} days  "
-        f"(positive = alerted before clinical onset)\n"
-        f"  Mean outbreak recovery         = {rec_str}"
+        + det_str
     )
 
     # ── Prompt ────────────────────────────────────────────────────────────────
@@ -526,24 +640,27 @@ Avoid statistical jargon.  Write for a non-technical public health decision-make
 Do not fabricate specific policy recommendations beyond what the data shows.\
 """
 
-    # ── LM Studio API call (OpenAI-compatible) ────────────────────────────────
-    logger.info("Calling LM Studio at {} with model {} …", _base_url, _model)
+    # ── LM Studio API call (direct httpx — no openai package required) ──────────
+    # LM Studio serves an OpenAI-compatible HTTP endpoint at /v1/chat/completions.
+    # We call it directly with httpx so the openai package is not a dependency.
+    import httpx
+
+    endpoint = f"{_base_url.rstrip('/')}/chat/completions"
+    payload  = {
+        "model":       _model,
+        "messages":    [{"role": "user", "content": prompt}],
+        "max_tokens":  LLM_MAX_TOKENS,
+        "temperature": 0.4,
+    }
+    logger.info("Calling LM Studio at {} (model={}) …", endpoint, _model)
     try:
-        client = OpenAI(
-            base_url=_base_url,
-            api_key="lm-studio",   # required by the openai client; ignored by LM Studio
-        )
-        response = client.chat.completions.create(
-            model=_model,
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=LLM_MAX_TOKENS,
-            temperature=0.4,       # lower temp → more factual, less hallucination
-        )
-        return response.choices[0].message.content
+        resp = httpx.post(endpoint, json=payload, timeout=180.0)
+        resp.raise_for_status()
+        return resp.json()["choices"][0]["message"]["content"]
     except Exception as exc:
         logger.error("LM Studio call failed: {}", exc)
         raise RuntimeError(
-            f"LM Studio at {_base_url} returned an error: {exc}\n"
+            f"LM Studio at {endpoint} returned an error: {exc}\n"
             "Make sure LM Studio is running and a model is loaded."
         ) from exc
 
@@ -572,55 +689,56 @@ def _badge_metric(val: float, warn: float, good: float) -> str:
     return f"[red]{formatted}[/red]"
 
 
-def _print_key_takeaways(result: "EvalResult") -> None:
-    lt = result.lead_time
+def _print_key_takeaways(result: "EvalReport") -> None:
+    prob = result.prob
+    det  = result.det
     lines: list[str] = []
 
     # Coverage calibration
-    cov50_err = abs(result.coverage_50 - 0.50)
-    cov95_err = abs(result.coverage_95 - 0.95)
+    cov50_err = abs(prob.coverage_50 - 0.50)
+    cov95_err = abs(prob.coverage_95 - 0.95)
     if cov50_err > 0.15 or cov95_err > 0.10:
         lines.append(
             f"[yellow]⚠ Prediction intervals are miscalibrated[/yellow] "
-            f"(50 % PI={result.coverage_50:.0%}, 95 % PI={result.coverage_95:.0%}). "
+            f"(50 % PI={prob.coverage_50:.0%}, 95 % PI={prob.coverage_95:.0%}). "
             "Consider wider intervals or recalibration."
         )
     else:
         lines.append("[green]✓ Prediction intervals are well-calibrated.[/green]")
 
-    # AUC
-    if not np.isnan(lt.auc):
-        if lt.auc >= 0.85:
-            lines.append(f"[green]✓ AUC={lt.auc:.3f} — model is a strong outbreak detector.[/green]")
-        elif lt.auc >= 0.70:
-            lines.append(f"[yellow]△ AUC={lt.auc:.3f} — moderate discriminative power.[/yellow]")
-        else:
-            lines.append(f"[red]✗ AUC={lt.auc:.3f} — model barely better than random for outbreak detection.[/red]")
+    # Detection performance
+    if det is not None:
+        if not np.isnan(det.f1):
+            if det.f1 >= 0.80:
+                lines.append(f"[green]✓ F1={det.f1:.3f} — strong outbreak detection.[/green]")
+            elif det.f1 >= 0.60:
+                lines.append(f"[yellow]△ F1={det.f1:.3f} — moderate detection performance.[/yellow]")
+            else:
+                lines.append(f"[red]✗ F1={det.f1:.3f} — poor detection performance.[/red]")
 
-    # Lead time vs. target window (7–21 days)
-    if not np.isnan(lt.mean_lead_days):
-        if 7 <= lt.mean_lead_days <= 21:
+        if not np.isnan(det.mean_ttd_days):
+            if 7 <= det.mean_ttd_days <= 21:
+                lines.append(
+                    f"[green]✓ Mean TTD {det.mean_ttd_days:.1f} days is within the "
+                    f"target 7–21 day biosurveillance window.[/green]"
+                )
+            elif det.mean_ttd_days > 21:
+                lines.append(
+                    f"[yellow]△ TTD {det.mean_ttd_days:.1f} days — WW signal is alerting "
+                    "very early; validate alerts aren't noise.[/yellow]"
+                )
+            else:
+                lines.append(
+                    f"[red]✗ TTD {det.mean_ttd_days:.1f} days — detection is lagging "
+                    "clinical onset; limited early-warning value.[/red]"
+                )
+        if det.fn > 0:
             lines.append(
-                f"[green]✓ Mean lead time {lt.mean_lead_days:.1f} days is within the "
-                f"target 7–21 day biosurveillance window.[/green]"
+                f"[red]✗ {det.fn} missed outbreak(s). "
+                "Consider lowering the alert threshold.[/red]"
             )
-        elif lt.mean_lead_days > 21:
-            lines.append(
-                f"[yellow]△ Lead time {lt.mean_lead_days:.1f} days exceeds 21 days — "
-                "model may be overly sensitive (early false alarms).[/yellow]"
-            )
-        else:
-            lines.append(
-                f"[red]✗ Lead time {lt.mean_lead_days:.1f} days — model is alerting "
-                "too late for clinical intervention.[/red]"
-            )
+    else:
+        lines.append("[dim]Detection metrics require OutbreakClassifier output.[/dim]")
 
-    # False negatives
-    if lt.fn > 0:
-        lines.append(
-            f"[red]✗ {lt.fn} missed outbreak(s). "
-            "Consider lowering the alert threshold or extending the forecast horizon.[/red]"
-        )
-
-    text = "\n".join(f"  {l}" for l in lines)
+    text = "\n".join(f"  {ln}" for ln in lines)
     console.print(Panel(text, title="[bold]Key Takeaways[/bold]", border_style="yellow"))

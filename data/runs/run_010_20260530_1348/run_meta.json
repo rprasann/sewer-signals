@@ -1,0 +1,29 @@
+{
+  "run_id": "run_010_20260530_1348",
+  "label": "20260530_1348",
+  "run_date": "2026-05-30",
+  "counties": [
+    "Alameda",
+    "Contra Costa",
+    "Marin",
+    "Napa",
+    "San Francisco",
+    "San Mateo",
+    "Santa Clara",
+    "Solano",
+    "Sonoma"
+  ],
+  "n_counties": 9,
+  "phase": "Phase 5",
+  "metrics": {
+    "mean_wis": 0.6934087927402138,
+    "coverage_50": 0.017857142857142856,
+    "coverage_95": 0.30357142857142855,
+    "mae": 0.8996141208409509,
+    "pinball_ratio": 7.817967529463902,
+    "precision": NaN,
+    "recall": NaN,
+    "f1": NaN
+  },
+  "notes": "max_steps=500, skip_cv=True"
+}

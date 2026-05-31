@@ -49,7 +49,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from loguru import logger
-
 from neuralforecast.losses.pytorch import MQLoss
 
 from src.config import (
@@ -430,7 +429,9 @@ class PINNWastewaterLoss(MQLoss):
         dtype  = y_hat.dtype
 
         if y_insample is None or self.min_pi_width_multiplier <= 0:
-            return torch.tensor(self.min_pi_width, device=device, dtype=dtype)
+            # Fallback: use min_pi_width_floor (the Phase 6 parameter), not the
+            # Phase 3 legacy min_pi_width, so quiet-period rows aren't over-widened.
+            return torch.tensor(self.min_pi_width_floor, device=device, dtype=dtype)
 
         # ── 1. Case history vol (lagging) ─────────────────────────────────────
         ys = y_insample.squeeze(-1) if y_insample.dim() == 3 else y_insample  # [B, T]
@@ -445,7 +446,10 @@ class PINNWastewaterLoss(MQLoss):
         forecast_vol    = torch.nan_to_num(forecast_vol, nan=0.0)
 
         effective_vol = torch.maximum(case_vol, forecast_vol)
-        dyn = (self.min_pi_width_multiplier * effective_vol).clamp(min=self.min_pi_width)
+        # Clamp to min_pi_width_floor (Phase 6) — NOT the Phase 3 legacy min_pi_width.
+        # The old clamp(min=self.min_pi_width=2.5) was the bug that forced Coverage95=100%:
+        # quiet-period σ≈0.3 → multiplier×0.3=0.6–0.9 → clamped to 2.5 → always too wide.
+        dyn = (self.min_pi_width_multiplier * effective_vol).clamp(min=self.min_pi_width_floor)
         return dyn.unsqueeze(-1)                               # [B, 1, 1] for H×N broadcast
 
     def _underdispersion_penalty(

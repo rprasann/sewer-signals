@@ -33,6 +33,7 @@ import pandas as pd
 from loguru import logger
 from sklearn.preprocessing import RobustScaler
 
+import src.config as _cfg  # used for dynamic BAY_AREA_FIPS lookup (apply_geography() safe)
 from src.config import (
     BAY_AREA_FIPS,
     CA_WW_SIGNAL_COL,
@@ -43,7 +44,6 @@ from src.config import (
     NWSS_DATE_COL,
     OUTLIER_Z_THRESHOLD,
     POPULATION_COL,
-    SECONDARY_UNIT,
     SEWERSHED_COL,
     TARGET_COL,
     TARGET_UNIT,
@@ -83,7 +83,8 @@ class WastewaterProcessor:
         fips_filter: list[str] | None = None,
         target_unit: str | None = None,
     ) -> None:
-        self.fips_filter: list[str] = fips_filter or list(BAY_AREA_FIPS.values())
+        # Use _cfg.BAY_AREA_FIPS (module attribute) so apply_geography() updates propagate.
+        self.fips_filter: list[str] = fips_filter or list(_cfg.BAY_AREA_FIPS.values())
         # Defaults to copies/g dry sludge; pass SECONDARY_UNIT for liquid-track comparison
         self.target_unit: str = target_unit if target_unit is not None else TARGET_UNIT
         self._scaler: RobustScaler | None = None   # alias to first county's scaler
@@ -154,8 +155,9 @@ class WastewaterProcessor:
         call ``load_scalers()`` to reconstruct the exact inversion parameters
         without re-running the full pipeline.
         """
-        import joblib
         from pathlib import Path as _Path
+
+        import joblib
         joblib.dump(
             {"scalers": self._scalers, "scale_cols": self._scale_cols},
             _Path(path),
@@ -169,8 +171,9 @@ class WastewaterProcessor:
         compat ``self._scaler`` alias so that ``_invert_scaling_to_log1p``
         works without needing to re-run the pipeline.
         """
-        import joblib
         from pathlib import Path as _Path
+
+        import joblib
         payload = joblib.load(_Path(path))
         self._scalers = payload["scalers"]
         self._scale_cols = payload["scale_cols"]
@@ -748,12 +751,27 @@ class WastewaterProcessor:
         df = df.sort_values([COUNTY_COL, NWSS_DATE_COL]).copy()
 
         if fit:
+            from src.config import SCALER_IQR_FLOOR
             self._scalers = {}
             frames = []
             for fips, grp in df.groupby(COUNTY_COL):
                 scaler = RobustScaler()
                 grp = grp.copy()
-                grp[self._scale_cols] = scaler.fit_transform(grp[self._scale_cols])
+
+                # Fit first to learn center_ and scale_, then floor scale_ BEFORE
+                # transforming.  This prevents division-by-near-zero for counties
+                # with very sparse data (e.g. Napa/Solano: 2–3 training weeks,
+                # IQR ≈ 0.089–0.146 vs 1.3–1.7 for active counties).
+                scaler.fit(grp[self._scale_cols])
+                needs_floor = scaler.scale_ < SCALER_IQR_FLOOR
+                if needs_floor.any():
+                    scaler.scale_ = np.maximum(scaler.scale_, SCALER_IQR_FLOOR)
+                    logger.debug(
+                        "_apply_scaling: IQR floor applied for {} on {} feature(s).",
+                        fips, int(needs_floor.sum()),
+                    )
+                grp[self._scale_cols] = scaler.transform(grp[self._scale_cols])
+
                 self._scalers[fips] = scaler
                 frames.append(grp)
             # Alias for backward compat with single-scaler consumers
@@ -882,10 +900,11 @@ class CAWastewaterProcessor(WastewaterProcessor):
         )
         df["county_site"] = df[site_col] if site_col else "unknown"
 
-        # County name → FIPS (internal join key used by all downstream stages)
+        # County name → FIPS (internal join key used by all downstream stages).
+        # Use _cfg.BAY_AREA_FIPS (module attribute) so apply_geography() updates propagate.
         if "county_name" not in df.columns:
             raise ValueError("Column 'county_name' missing — ensure _load_ca_ww_csv renamed 'County'.")
-        df[COUNTY_COL] = df["county_name"].map(BAY_AREA_FIPS)
+        df[COUNTY_COL] = df["county_name"].map(_cfg.BAY_AREA_FIPS)
 
         # Drop rows with missing critical values
         before = len(df)

@@ -86,16 +86,24 @@ def synthetic_cases_df() -> pd.DataFrame:
 
 @pytest.fixture()
 def mock_processor():
-    """Mock WastewaterProcessor with a fitted RobustScaler."""
+    """Mock WastewaterProcessor with per-county _scalers dict (Phase 6 layout).
 
-    class _MockProc:
-        _scale_cols = [TARGET_COL]
-        _scaler: RobustScaler | None = None
+    _invert_scaling_to_log1p checks _scalers first (Problem 1 fix in processor.py)
+    before falling back to _scaler.  The mock must satisfy the per-county path.
+    """
+    from src.config import TARGET_COL as _TC
 
-    proc = _MockProc()
     raw = np.array([0.5, 1.0, 2.0, 3.0, 4.0]).reshape(-1, 1)
-    proc._scaler = RobustScaler().fit(raw)
-    return proc
+    fitted = RobustScaler().fit(raw)
+
+    # The inversion function uses _scalers[fips].center_[col_idx] and .scale_[col_idx]
+    # where col_idx = _scale_cols.index(TARGET_COL).
+    class _MockProc:
+        _scale_cols = [_TC]
+        _scaler     = fitted   # legacy alias (backward compat path)
+        _scalers    = {"06075": fitted}   # per-county dict used by Phase 6 path
+
+    return _MockProc()
 
 
 @pytest.fixture()
@@ -264,6 +272,11 @@ class TestSplitRaw:
 # ===========================================================================
 
 class TestInvertScalingToLog1p:
+    """_invert_scaling_to_log1p uses per-county _scalers dict (Phase 6).
+
+    All test DataFrames must include a "unique_id" column (or COUNTY_COL)
+    matching a key in mock_processor._scalers so the per-county path is exercised.
+    """
 
     def test_roundtrip_accuracy(self, mock_processor):
         """Inverting scaled values should recover original log1p values exactly."""
@@ -272,26 +285,25 @@ class TestInvertScalingToLog1p:
             original_log1p.reshape(-1, 1)
         ).flatten()
 
-        df = pd.DataFrame({TARGET_COL: scaled})
+        # unique_id must match a key in mock_processor._scalers ("06075")
+        df = pd.DataFrame({"unique_id": ["06075"] * 5, TARGET_COL: scaled})
         result = _invert_scaling_to_log1p(df, mock_processor, cols=[TARGET_COL])
         recovered = result[TARGET_COL].to_numpy()
 
         np.testing.assert_allclose(recovered, original_log1p, rtol=1e-6,
                                    err_msg="Roundtrip inversion failed")
 
-    def test_no_op_when_scaler_none(self):
-        """When scaler is None, columns are returned unchanged."""
-        class NoScaler:
-            _scaler = None
-            _scale_cols = [TARGET_COL]
-
-        df = pd.DataFrame({TARGET_COL: [1.0, 2.0, 3.0]})
-        result = _invert_scaling_to_log1p(df, NoScaler(), cols=[TARGET_COL])
+    def test_no_op_when_county_not_in_scalers(self, mock_processor):
+        """When the county FIPS is not in _scalers, columns are left unchanged."""
+        df = pd.DataFrame({"unique_id": ["99999", "99999", "99999"],
+                           TARGET_COL: [1.0, 2.0, 3.0]})
+        result = _invert_scaling_to_log1p(df, mock_processor, cols=[TARGET_COL])
+        # County 99999 has no scaler → inversion skipped → values unchanged
         pd.testing.assert_series_equal(result[TARGET_COL], df[TARGET_COL])
 
     def test_unknown_col_skipped(self, mock_processor):
         """Columns not in the DataFrame are silently skipped."""
-        df = pd.DataFrame({TARGET_COL: [0.5, 1.0]})
+        df = pd.DataFrame({"unique_id": ["06075", "06075"], TARGET_COL: [0.5, 1.0]})
         result = _invert_scaling_to_log1p(
             df, mock_processor, cols=[TARGET_COL, "does_not_exist"]
         )
@@ -305,7 +317,7 @@ class TestInvertScalingToLog1p:
             log1p_vals.reshape(-1, 1)
         ).flatten()
 
-        df = pd.DataFrame({TARGET_COL: scaled})
+        df = pd.DataFrame({"unique_id": ["06075"] * 4, TARGET_COL: scaled})
         unscaled = _invert_scaling_to_log1p(df, mock_processor, cols=[TARGET_COL])
         copies = np.expm1(unscaled[TARGET_COL].to_numpy()).clip(0)
         assert (copies >= 0).all()

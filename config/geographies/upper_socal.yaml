@@ -1,0 +1,118 @@
+# Upper Southern California geography configuration
+# ==================================================
+# Kern, Los Angeles, San Luis Obispo, Santa Barbara, Ventura counties
+# Data: same CA Wastewater Surveillance CSV + CA Statewide Cases/Deaths/Tests CSV
+#       as Bay Area — no new files required.
+#
+# ═══════════════════════════════════════════════════════════════════════════════
+# STICKING POINTS — READ BEFORE RUNNING
+# ═══════════════════════════════════════════════════════════════════════════════
+#
+# 1. VERIFY train_end_date BEFORE RUNNING
+#    The dates below match Bay Area defaults.  You MUST check that all 5 counties
+#    have ≥ INPUT_SIZE+H = 34 weeks of solid-track WW data before train_end_date.
+#    Run this diagnostic first:
+#      uv run python -c "
+#        from main import _load_ca_ww_csv
+#        from pathlib import Path
+#        df = _load_ca_ww_csv(Path('data/raw/California_Wastewater_Surveillance_Data.csv'))
+#        print(df[df['county_name'].isin(['Kern','Los Angeles','San Luis Obispo','Santa Barbara','Ventura'])]
+#              .groupby('county_name')['sample_collect_date'].agg(['min','max','count']))
+#      "
+#    Adjust train_end_date to be at least 34 weeks after the LAST county joined.
+#
+# 2. VERIFY exclude_fips
+#    After running the diagnostic above, any county with < 34 solid-track weeks
+#    before train_end_date should be added to exclude_fips.  They will be included
+#    at inference (quiet prior) but skipped at training time.
+#
+# 3. LA COUNTY SCALE
+#    Los Angeles has ~10M people and potentially 100+ WWTPs.  The
+#    population-weighted aggregation is correct but the resulting signal may have
+#    different amplitude characteristics than smaller counties.  The RobustScaler
+#    handles this per-county, but check log1p_concentration distributions after
+#    first processing run.
+#
+# 4. OUTBREAK VALIDATION WINDOWS
+#    The windows below use approximate dates.  Verify against actual SoCal case
+#    data — surge timing can differ from Bay Area by 2–4 weeks.
+#
+# 5. VALIDATION SET CHOICE
+#    validation_counties below defaults to LA + Santa Barbara + Ventura.
+#    Adjust to the 3 counties with the most complete WW data history.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+name: "Upper Southern California"
+shortname: "upper_socal"
+
+# county_name must exactly match the "County" column in the CA WW CSV
+counties:
+  Kern:               "06029"
+  "Los Angeles":      "06037"
+  "San Luis Obispo":  "06079"
+  "Santa Barbara":    "06083"
+  Ventura:            "06111"
+
+# 2020 US Census county populations
+populations:
+  "06029": 909235     # Kern
+  "06037": 10014009   # Los Angeles
+  "06079": 283111     # San Luis Obispo
+  "06083": 448229     # Santa Barbara
+  "06111": 843843     # Ventura
+
+# Validation set — counties with fullest WW history (data diagnostic 2026-05-30)
+# Ventura excluded (data ends 2023-06-30, only 185 rows). SLO added instead.
+validation_counties: ["06037", "06079", "06083"]   # LA, San Luis Obispo, Santa Barbara
+
+# Counties to exclude from training (insufficient solid-track WW history).
+# Data diagnostic run 2026-05-30:
+#   Kern (06029):    ZERO solid-track rows in CA WW CSV → exclude
+#   Ventura (06111): 185 rows, 2023-01-25 → 2023-06-30 only (< 10 weeks before train_end) → exclude
+# LA (06037):         4027 rows, 2022-01-12 →; first consistent 2022-01-12
+# San Luis Obispo (06079): 1575 rows, 2022-01-12 →; first consistent 2022-01-12
+# Santa Barbara (06083):  2083 rows, 2022-08-03 →; first consistent 2022-08-03  ← latest joiner
+exclude_fips: ["06029", "06111"]   # Kern: no data; Ventura: < 10 training weeks
+
+# ── Data availability window ──────────────────────────────────────────────────
+data_start_date: "2020-07-01"
+data_end_date:   "2023-12-19"
+
+# ── CV split boundaries ───────────────────────────────────────────────────────
+# train_end_date: 34 weeks (INPUT_SIZE + H) after Santa Barbara joined (2022-08-03).
+#   34 weeks after 2022-08-03 = 2023-03-29 → next W-WED = 2023-04-05.
+# val_end_date: leaves ~24-week holdout (mirrors Bay Area's 28-week holdout).
+#   CV window: Apr 5 → Aug 2 = 17 weeks (~4 expanding folds at step_weeks=4).
+train_end_date: "2023-04-05"
+val_end_date:   "2023-08-02"
+
+# ── Dashboard map ─────────────────────────────────────────────────────────────
+map_center_lat: 34.5
+map_center_lon: -118.8
+map_zoom: 6.0
+
+# County centroids for the bubble map (lat, lon)
+centroids:
+  "06029": [35.3428, -119.0459]   # Kern
+  "06037": [34.0522, -118.2437]   # Los Angeles
+  "06079": [35.3102, -120.4358]   # San Luis Obispo
+  "06083": [34.4208, -119.6982]   # Santa Barbara
+  "06111": [34.2746, -119.2290]   # Ventura
+
+# ── Outbreak validation windows (for --outbreak-validation flag) ──────────────
+# Approximate SoCal surge dates — verify against local case data before using.
+# Kern + Ventura excluded (no data / insufficient data — see exclude_fips above).
+# Delta window uses only LA (SLO/SB WW data starts 2022-01-12 / 2022-08-03).
+outbreak_validation_windows:
+  - name: "Delta 2021"
+    eval_start: "2021-07-28"
+    eval_end:   "2021-09-22"
+    counties:   ["06037"]            # only LA has WW data this early
+  - name: "Omicron BA.1"
+    eval_start: "2021-12-15"
+    eval_end:   "2022-02-23"
+    counties:   ["06037", "06079"]   # LA + SLO (SB joins Aug 2022)
+  - name: "XBB.1.5 Onset"
+    eval_start: "2022-12-14"
+    eval_end:   "2023-01-25"
+    counties:   ["06037", "06079", "06083"]   # all 3 active training counties

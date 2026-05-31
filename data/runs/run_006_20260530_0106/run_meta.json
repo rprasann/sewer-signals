@@ -1,0 +1,19 @@
+{
+  "run_id": "run_006_20260530_0106",
+  "label": "20260530_0106",
+  "run_date": "2026-05-30",
+  "counties": [
+    "San Francisco",
+    "San Mateo",
+    "Santa Clara"
+  ],
+  "n_counties": 3,
+  "phase": "Phase 5",
+  "metrics": {
+    "mean_wis": 0.906503261927324,
+    "coverage_50": 0.0,
+    "coverage_95": 0.16666666666666666,
+    "mae": 1.3011249564574043
+  },
+  "notes": "max_steps=500, skip_cv=True"
+}

@@ -1,0 +1,25 @@
+{
+  "run_id": "run_008_20260530_0829",
+  "label": "20260530_0829",
+  "run_date": "2026-05-30",
+  "counties": [
+    "Alameda",
+    "Contra Costa",
+    "Marin",
+    "Napa",
+    "San Francisco",
+    "San Mateo",
+    "Santa Clara",
+    "Solano",
+    "Sonoma"
+  ],
+  "n_counties": 9,
+  "phase": "Phase 5",
+  "metrics": {
+    "mean_wis": 0.6019861828110941,
+    "coverage_50": 0.017857142857142856,
+    "coverage_95": 0.8571428571428571,
+    "mae": 0.9611032210894221
+  },
+  "notes": "max_steps=500, skip_cv=True"
+}
